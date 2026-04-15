@@ -21,12 +21,12 @@ import (
 func newTestOutbox(t *testing.T) (*outbox.Outbox, func()) {
 	t.Helper()
 	dbPath := t.TempDir() + "/test.db"
-	db, err := store.Open(dbPath)
+	s, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ob := outbox.New(db, 30*time.Second)
-	return ob, func() { db.Close() }
+	ob := outbox.New(s.DB(), 30*time.Second)
+	return ob, func() { s.Close() }
 }
 
 func TestHealthRequiresAuth(t *testing.T) {
