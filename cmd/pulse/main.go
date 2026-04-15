@@ -72,6 +72,7 @@ func run(dataDir, addr string) error {
 		Builder:      builder,
 		Claude:       cc,
 		DefaultModel: defaultModel,
+		Store:        s,
 	})
 	if err != nil {
 		return err

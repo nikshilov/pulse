@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -416,5 +417,31 @@ func TestMsgReturnsBadGatewayOnEmptyReply(t *testing.T) {
 	resp := postMsg(t, ts, `{"chat_id":42,"message_id":1,"text":"hi"}`)
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Errorf("expected 502, got %d", resp.StatusCode)
+	}
+}
+
+func TestIngestRouteWired(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	srv, err := New(Config{
+		IPCSecret: "secret",
+		Store:     s,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	body := strings.NewReader(`{"observations":[]}`)
+	req := httptest.NewRequest(http.MethodPost, "/ingest", body)
+	req.Header.Set("X-Pulse-Key", "secret")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
