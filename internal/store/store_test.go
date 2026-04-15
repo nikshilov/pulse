@@ -33,8 +33,8 @@ func TestOpenCreatesSchema(t *testing.T) {
 	if err := db.QueryRow("SELECT MAX(version) FROM schema_meta").Scan(&version); err != nil {
 		t.Fatalf("schema_meta: %v", err)
 	}
-	if version != 4 {
-		t.Errorf("expected schema version 4, got %d", version)
+	if version != 5 {
+		t.Errorf("expected schema version 5, got %d", version)
 	}
 }
 
@@ -54,8 +54,8 @@ func TestOpenIsIdempotent(t *testing.T) {
 	if err := db2.QueryRow("SELECT MAX(version) FROM schema_meta").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Errorf("expected still at version 4, got %d", version)
+	if version != 5 {
+		t.Errorf("expected still at version 5, got %d", version)
 	}
 }
 
@@ -92,13 +92,13 @@ func TestContextSchemaApplied(t *testing.T) {
 		t.Error("expected sessions_fts virtual table")
 	}
 
-	// Migration version bumped to 4 (004_extraction added).
+	// Migration version bumped to 5 (005_graph added).
 	var version int
 	if err := db.QueryRow("SELECT MAX(version) FROM schema_meta").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Errorf("expected schema version 4, got %d", version)
+	if version != 5 {
+		t.Errorf("expected schema version 5, got %d", version)
 	}
 }
 
@@ -164,6 +164,47 @@ func TestMigration004ExtractionJobs(t *testing.T) {
         VALUES ('[4]', 'bogus_state', 0, '2026-04-15T00:00:00Z', '2026-04-15T00:00:00Z')`)
 	if err == nil {
 		t.Fatal("expected CHECK violation for bogus state")
+	}
+}
+
+func TestMigration005Graph(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	tables := []string{
+		"entities", "entity_identities", "relations", "facts", "events",
+		"evidence", "score_history", "entity_merge_proposals",
+		"sensitive_actors", "open_questions",
+	}
+	for _, table := range tables {
+		var name string
+		err := db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&name)
+		if err != nil {
+			t.Errorf("table %s missing: %v", table, err)
+		}
+	}
+
+	// CASCADE on entity delete
+	_, err = db.Exec(`INSERT INTO entities (canonical_name, kind, first_seen, last_seen) VALUES ('test','person','2026-04-15T00:00:00Z','2026-04-15T00:00:00Z')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO entity_identities (entity_id, source_kind, identifier, first_seen) VALUES (1,'tg','123','2026-04-15T00:00:00Z')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM entities WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	var count int
+	db.QueryRow(`SELECT COUNT(*) FROM entity_identities WHERE entity_id=1`).Scan(&count)
+	if count != 0 {
+		t.Errorf("expected cascade delete, got %d identities", count)
 	}
 }
 
