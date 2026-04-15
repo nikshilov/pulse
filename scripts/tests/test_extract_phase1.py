@@ -270,3 +270,38 @@ def test_relation_upsert_bumps_strength_and_updates_last_seen(tmp_path):
     assert row2[1] == first_seen_before, "first_seen must be preserved"
     # last_seen is a second-resolution timestamp — it can equal first_seen if both runs are in
     # the same second; the invariant is that strength bumped, which the previous assert verified.
+
+
+def test_fact_insert_or_ignore_is_noop_on_duplicate(tmp_path):
+    """Second apply of the same (entity_id, text) fact must not raise, must not duplicate."""
+    db = tmp_path / "p1.db"
+    _apply_migrations(db)
+
+    con = pulse_extract._open_connection(str(db))
+    con.execute(
+        """INSERT INTO observations
+           (source_kind, source_id, content_hash, version, scope, captured_at,
+            observed_at, actors, content_text, metadata, raw_json)
+           VALUES ('claude_jsonl','f:1','h1',1,'shared','2026-04-16T00:00:00Z',
+                   '2026-04-16T00:00:00Z','[]','t','{}','{}')"""
+    )
+    result = {
+        "entities": [{"canonical_name": "Anna", "kind": "person"}],
+        "events": [],
+        "relations": [],
+        "facts": [{"entity": "Anna", "text": "loves coffee", "confidence": 0.9}],
+    }
+    con.execute("BEGIN IMMEDIATE")
+    r1 = pulse_extract._apply_extraction(con, 1, result)
+    con.execute("COMMIT")
+    assert r1["facts_written"] == 1
+
+    con.execute("BEGIN IMMEDIATE")
+    r2 = pulse_extract._apply_extraction(con, 1, result)
+    con.execute("COMMIT")
+
+    rows = con.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+    failed = [f for f in r2["failed_items"] if f["item_kind"] == "fact"]
+    con.close()
+    assert rows == 1, "fact must not be duplicated"
+    assert failed == [], "duplicate must be silent, not a failed_item"
