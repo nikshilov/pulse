@@ -490,3 +490,70 @@ def test_save_artifact_is_idempotent_under_partial_unique(tmp_path):
     con.close()
     assert rows == 1, "partial UNIQUE + INSERT OR IGNORE keeps exactly one row"
     assert payload == {"v": 1}, "first save wins; re-save is a no-op (retry-safe, no surprise overwrite)"
+
+
+def test_triage_artifact_saved_after_sonnet_call(tmp_path, monkeypatch):
+    """After run_once, the triage artifact for that job is present."""
+    db = tmp_path / "p1.db"
+    _apply_migrations(db)
+
+    con = sqlite3.connect(db)
+    con.execute(
+        """INSERT INTO observations(source_kind,source_id,content_hash,version,scope,captured_at,observed_at,actors,content_text,metadata,raw_json)
+           VALUES ('claude_jsonl','f:1','h',1,'shared','2026-04-16T00:00:00Z','2026-04-16T00:00:00Z','[]','t','{}','{}')"""
+    )
+    con.execute(
+        "INSERT INTO extraction_jobs(observation_ids,state,attempts,created_at,updated_at) VALUES ('[1]','pending',0,'2026-04-16T00:00:00Z','2026-04-16T00:00:00Z')"
+    )
+    con.commit()
+    con.close()
+
+    monkeypatch.setattr(pulse_extract, "call_sonnet_triage",
+                        lambda _p, expected_count: [{"verdict": "skip"} for _ in range(expected_count)])
+
+    pulse_extract.run_once(str(db))
+
+    con = sqlite3.connect(db)
+    row = con.execute(
+        "SELECT payload_json FROM extraction_artifacts WHERE job_id=1 AND kind='triage'"
+    ).fetchone()
+    con.close()
+    assert row is not None
+    payload = json.loads(row[0])
+    assert payload == [{"verdict": "skip"}]
+
+
+def test_restart_reuses_triage_artifact_no_sonnet_call(tmp_path, monkeypatch):
+    """If a triage artifact already exists for the job, call_sonnet_triage must not be called."""
+    db = tmp_path / "p1.db"
+    _apply_migrations(db)
+
+    con = sqlite3.connect(db)
+    con.execute(
+        """INSERT INTO observations(source_kind,source_id,content_hash,version,scope,captured_at,observed_at,actors,content_text,metadata,raw_json)
+           VALUES ('claude_jsonl','f:1','h',1,'shared','2026-04-16T00:00:00Z','2026-04-16T00:00:00Z','[]','t','{}','{}')"""
+    )
+    con.execute(
+        "INSERT INTO extraction_jobs(observation_ids,state,attempts,created_at,updated_at) VALUES ('[1]','pending',0,'2026-04-16T00:00:00Z','2026-04-16T00:00:00Z')"
+    )
+    con.execute(
+        "INSERT INTO extraction_artifacts(job_id,kind,obs_id,payload_json,model) VALUES (1,'triage',NULL,'[{\"verdict\":\"skip\"}]','sonnet-cached')"
+    )
+    con.commit()
+    con.close()
+
+    call_count = {"n": 0}
+
+    def boom_triage(*_a, **_kw):
+        call_count["n"] += 1
+        raise AssertionError("Sonnet must not be called when triage artifact exists")
+
+    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", boom_triage)
+
+    pulse_extract.run_once(str(db))
+    assert call_count["n"] == 0, "Sonnet was called despite artifact being present"
+
+    con = sqlite3.connect(db)
+    state = con.execute("SELECT state FROM extraction_jobs WHERE id=1").fetchone()[0]
+    con.close()
+    assert state == "done", "skip-all-obs triage → done"
