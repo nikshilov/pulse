@@ -63,3 +63,25 @@ def test_e2e_extraction_creates_graph(tmp_path, monkeypatch):
 
     job_state = con.execute("SELECT state FROM extraction_jobs WHERE id=1").fetchone()[0]
     assert job_state == "done"
+
+
+def test_e2e_prints_apply_report(tmp_path, monkeypatch, capsys):
+    fixtures = json.loads(FIXTURES.read_text())
+    db = _seed(tmp_path)
+
+    def fake_triage(*_args, **_kwargs):
+        return prompts.parse_triage_response(fixtures["triage"], expected_count=2)
+
+    def fake_extract(_prompt):
+        return fixtures["extract_1"]
+
+    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", fake_triage)
+    monkeypatch.setattr(pulse_extract, "call_opus_extract", fake_extract)
+
+    rc = pulse_extract.run_once(str(db))
+    assert rc == 0
+
+    captured = capsys.readouterr()
+    assert "apply_report=" in captured.out
+    # Sanity: the report must mention at least one entity_written
+    assert '"entities_written"' in captured.out
