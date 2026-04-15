@@ -105,6 +105,10 @@ const (
 	opRevision
 )
 
+// upsert returns (op, id, err) after deciding whether the observation is a new
+// insert, a duplicate, or a revision. SELECT-then-INSERT has a race: two concurrent
+// ingests of the same (source_kind, source_id) can both miss and both attempt INSERT.
+// TODO(task7): wrap in a transaction once the revision path is added.
 func (h *Handler) upsert(ctx context.Context, obs *capture.Observation) (op, int64, error) {
 	db := h.store.DB()
 	var existingID int64
@@ -131,9 +135,18 @@ func (h *Handler) upsert(ctx context.Context, obs *capture.Observation) (op, int
 }
 
 func insertObservation(ctx context.Context, db *sql.DB, obs *capture.Observation) (int64, error) {
-	actors, _ := json.Marshal(obs.Actors)
-	meta, _ := json.Marshal(obs.Metadata)
-	media, _ := json.Marshal(obs.MediaRefs)
+	actors, err := json.Marshal(obs.Actors)
+	if err != nil {
+		return 0, fmt.Errorf("marshal actors: %w", err)
+	}
+	meta, err := json.Marshal(obs.Metadata)
+	if err != nil {
+		return 0, fmt.Errorf("marshal metadata: %w", err)
+	}
+	media, err := json.Marshal(obs.MediaRefs)
+	if err != nil {
+		return 0, fmt.Errorf("marshal media_refs: %w", err)
+	}
 	res, err := db.ExecContext(ctx, `
 		INSERT INTO observations
 		  (source_kind, source_id, content_hash, version, scope,
