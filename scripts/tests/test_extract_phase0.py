@@ -38,3 +38,35 @@ def test_open_connection_sets_pragmas(tmp_path):
     assert isolation is None, (
         "isolation_level must be None so BEGIN/COMMIT are under our control"
     )
+
+
+def test_apply_extraction_returns_report(tmp_path):
+    db = tmp_path / "p0.db"
+    _apply_migrations(db)
+
+    con = pulse_extract._open_connection(str(db))
+    # seed one observation so the evidence FK resolves
+    con.execute(
+        """INSERT INTO observations
+           (source_kind, source_id, content_hash, version, scope, captured_at,
+            observed_at, actors, content_text, metadata, raw_json)
+           VALUES ('claude_jsonl','f:1','h1',1,'shared','2026-04-15T00:00:00Z',
+                   '2026-04-15T00:00:00Z','[]','hello','{}','{}')"""
+    )
+    con.execute("BEGIN IMMEDIATE")
+    result = {
+        "entities": [{"canonical_name": "Anna", "kind": "person", "aliases": ["Аня"]}],
+        "events": [],
+        "relations": [],
+        "facts": [],
+    }
+    report = pulse_extract._apply_extraction(con, 1, result)
+    con.execute("COMMIT")
+    con.close()
+
+    assert report["obs_id"] == 1
+    assert report["entities_written"] == 1
+    assert report["events_written"] == 0
+    assert report["relations_written"] == 0
+    assert report["facts_written"] == 0
+    assert report["failed_items"] == []
