@@ -162,10 +162,11 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
             for alias in (ent.get("aliases") or []):
                 name_to_id[alias] = entity_id
             report["entities_written"] += 1
-        except sqlite3.Error as ex:
+        except Exception as ex:
             con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
             con.execute(f"RELEASE SAVEPOINT {sp}")
-            _item_failure("entity", str(ex)[:200], {"index": idx, "canonical_name": ent.get("canonical_name", ""), "kind": ent.get("kind", "")})
+            _item_failure("entity", f"{type(ex).__name__}: {str(ex)[:200]}",
+                          {"index": idx, "canonical_name": ent.get("canonical_name", ""), "kind": ent.get("kind", "")})
 
     # --- events ---
     for idx, ev in enumerate(result.get("events", [])):
@@ -201,10 +202,11 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
             )
             con.execute(f"RELEASE SAVEPOINT {sp}")
             report["events_written"] += 1
-        except sqlite3.Error as ex:
+        except Exception as ex:
             con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
             con.execute(f"RELEASE SAVEPOINT {sp}")
-            _item_failure("event", str(ex)[:200], {"index": idx, "title": ev.get("title", "")})
+            _item_failure("event", f"{type(ex).__name__}: {str(ex)[:200]}",
+                          {"index": idx, "title": ev.get("title", "")})
 
     # --- relations ---
     for idx, rel in enumerate(result.get("relations", [])):
@@ -230,10 +232,11 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
             )
             con.execute(f"RELEASE SAVEPOINT {sp}")
             report["relations_written"] += 1
-        except sqlite3.Error as ex:
+        except Exception as ex:
             con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
             con.execute(f"RELEASE SAVEPOINT {sp}")
-            _item_failure("relation", str(ex)[:200], {"index": idx, "from": rel.get("from", ""), "to": rel.get("to", ""), "kind": rel.get("kind", "")})
+            _item_failure("relation", f"{type(ex).__name__}: {str(ex)[:200]}",
+                          {"index": idx, "from": rel.get("from", ""), "to": rel.get("to", ""), "kind": rel.get("kind", "")})
 
     # --- facts ---
     for idx, fact in enumerate(result.get("facts", [])):
@@ -258,10 +261,11 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
                 )
                 report["facts_written"] += 1
             con.execute(f"RELEASE SAVEPOINT {sp}")
-        except sqlite3.Error as ex:
+        except Exception as ex:
             con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
             con.execute(f"RELEASE SAVEPOINT {sp}")
-            _item_failure("fact", str(ex)[:200], {"index": idx, "entity": fact.get("entity", ""), "text": fact.get("text", "")[:80]})
+            _item_failure("fact", f"{type(ex).__name__}: {str(ex)[:200]}",
+                          {"index": idx, "entity": fact.get("entity", ""), "text": fact.get("text", "")[:80]})
 
     return report
 

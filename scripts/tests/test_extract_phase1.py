@@ -656,3 +656,40 @@ def test_restart_reuses_extract_artifact_per_obs(tmp_path, monkeypatch):
     assert names == {"Cached1", "Fresh2"}, (
         "obs 1 entity comes from cached artifact, obs 2 from fresh Opus call"
     )
+
+
+# ---------- Layer 4: hygiene (task #84) ----------
+
+def test_keyerror_in_entity_caught_by_savepoint(tmp_path):
+    """An entity dict missing canonical_name raises KeyError; SAVEPOINT must contain it
+    and the failure must land in failed_items, not propagate out."""
+    db = tmp_path / "p1.db"
+    _apply_migrations(db)
+
+    con = pulse_extract._open_connection(str(db))
+    con.execute(
+        """INSERT INTO observations(source_kind,source_id,content_hash,version,scope,captured_at,observed_at,actors,content_text,metadata,raw_json)
+           VALUES ('claude_jsonl','f:1','h',1,'shared','2026-04-16T00:00:00Z','2026-04-16T00:00:00Z','[]','t','{}','{}')"""
+    )
+    result = {
+        "entities": [
+            {"canonical_name": "Anna", "kind": "person"},
+            {"kind": "person"},  # malformed — no canonical_name
+            {"canonical_name": "Fedya", "kind": "person"},
+        ],
+        "events": [], "relations": [], "facts": [],
+    }
+    con.execute("BEGIN IMMEDIATE")
+    report = pulse_extract._apply_extraction(con, 1, result)
+    con.execute("COMMIT")
+
+    names = {r[0] for r in con.execute("SELECT canonical_name FROM entities")}
+    con.close()
+    assert names == {"Anna", "Fedya"}, "good entities survive a bad sibling"
+    assert report["entities_written"] == 2
+    bad = [f for f in report["failed_items"] if f["item_kind"] == "entity"]
+    assert len(bad) == 1
+    assert "KeyError" in bad[0]["reason"], (
+        f"failed_item reason must include KeyError (got {bad[0]['reason']!r})"
+    )
+    assert bad[0]["detail"]["index"] == 1
