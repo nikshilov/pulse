@@ -33,8 +33,8 @@ func TestOpenCreatesSchema(t *testing.T) {
 	if err := db.QueryRow("SELECT MAX(version) FROM schema_meta").Scan(&version); err != nil {
 		t.Fatalf("schema_meta: %v", err)
 	}
-	if version != 3 {
-		t.Errorf("expected schema version 3, got %d", version)
+	if version != 4 {
+		t.Errorf("expected schema version 4, got %d", version)
 	}
 }
 
@@ -54,8 +54,8 @@ func TestOpenIsIdempotent(t *testing.T) {
 	if err := db2.QueryRow("SELECT MAX(version) FROM schema_meta").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
-		t.Errorf("expected still at version 3, got %d", version)
+	if version != 4 {
+		t.Errorf("expected still at version 4, got %d", version)
 	}
 }
 
@@ -92,13 +92,13 @@ func TestContextSchemaApplied(t *testing.T) {
 		t.Error("expected sessions_fts virtual table")
 	}
 
-	// Migration version bumped to 3 (003_observations added).
+	// Migration version bumped to 4 (004_extraction added).
 	var version int
 	if err := db.QueryRow("SELECT MAX(version) FROM schema_meta").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
-		t.Errorf("expected schema version 3, got %d", version)
+	if version != 4 {
+		t.Errorf("expected schema version 4, got %d", version)
 	}
 }
 
@@ -131,6 +131,39 @@ func TestMigration003Observations(t *testing.T) {
         VALUES ('tg','m:1','h1',1,'nik','2026-04-15T00:00:00Z','2026-04-15T00:00:00Z','[]','hello','{}','{}')`)
 	if err == nil {
 		t.Fatal("expected UNIQUE violation, got nil")
+	}
+}
+
+func TestMigration004ExtractionJobs(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO extraction_jobs
+        (observation_ids, state, attempts, created_at, updated_at)
+        VALUES ('[1,2,3]', 'pending', 0, '2026-04-15T00:00:00Z', '2026-04-15T00:00:00Z')`)
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	var state string
+	err = db.QueryRow("SELECT state FROM extraction_jobs WHERE id=1").Scan(&state)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if state != "pending" {
+		t.Errorf("expected pending, got %s", state)
+	}
+
+	// CHECK constraint on state
+	_, err = db.Exec(`INSERT INTO extraction_jobs
+        (observation_ids, state, attempts, created_at, updated_at)
+        VALUES ('[4]', 'bogus_state', 0, '2026-04-15T00:00:00Z', '2026-04-15T00:00:00Z')`)
+	if err == nil {
+		t.Fatal("expected CHECK violation for bogus state")
 	}
 }
 
