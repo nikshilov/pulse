@@ -93,3 +93,46 @@ func TestIngestDedupsIdenticalHash(t *testing.T) {
 		t.Errorf("inserted should be 0, got %d", resp.Inserted)
 	}
 }
+
+func TestIngestRevisionOnHashChange(t *testing.T) {
+	s := openTestStore(t)
+	h := NewHandler(s)
+
+	base := capture.Observation{
+		SourceKind: "tg", SourceID: "m:1", ContentHash: "h1", Version: 1,
+		Scope:       "nik",
+		CapturedAt:  timeParse(t, "2026-04-15T00:00:00Z"),
+		ObservedAt:  timeParse(t, "2026-04-15T00:00:01Z"),
+		Actors:      []capture.ActorRef{{Kind: "tg_user", ID: "123"}},
+		ContentText: "hello",
+	}
+	body1, _ := json.Marshal(map[string]any{"observations": []capture.Observation{base}})
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewReader(body1)))
+
+	// Edited: content changed → new hash
+	edited := base
+	edited.ContentText = "hello world"
+	edited.ContentHash = "h2"
+
+	body2, _ := json.Marshal(map[string]any{"observations": []capture.Observation{edited}})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewReader(body2)))
+
+	var resp struct{ Inserted, Duplicates, Revisions int }
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Revisions != 1 {
+		t.Errorf("revisions: got %d", resp.Revisions)
+	}
+
+	// Check DB: version=2 exists, observation_revisions has one row
+	var maxVer int
+	s.DB().QueryRow(`SELECT MAX(version) FROM observations WHERE source_kind='tg' AND source_id='m:1'`).Scan(&maxVer)
+	if maxVer != 2 {
+		t.Errorf("max version: got %d", maxVer)
+	}
+	var revCount int
+	s.DB().QueryRow(`SELECT COUNT(*) FROM observation_revisions`).Scan(&revCount)
+	if revCount != 1 {
+		t.Errorf("revisions row count: got %d", revCount)
+	}
+}

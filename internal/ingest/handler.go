@@ -1,8 +1,6 @@
 package ingest
 
 import (
-	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -104,60 +102,3 @@ const (
 	opDuplicate
 	opRevision
 )
-
-// upsert returns (op, id, err) after deciding whether the observation is a new
-// insert, a duplicate, or a revision. SELECT-then-INSERT has a race: two concurrent
-// ingests of the same (source_kind, source_id) can both miss and both attempt INSERT.
-// TODO(task7): wrap in a transaction once the revision path is added.
-func (h *Handler) upsert(ctx context.Context, obs *capture.Observation) (op, int64, error) {
-	db := h.store.DB()
-	var existingID int64
-	var existingHash string
-	err := db.QueryRowContext(ctx, `
-		SELECT id, content_hash FROM observations
-		WHERE source_kind=? AND source_id=?
-		ORDER BY version DESC LIMIT 1`,
-		obs.SourceKind, obs.SourceID,
-	).Scan(&existingID, &existingHash)
-
-	if err == sql.ErrNoRows {
-		id, err := insertObservation(ctx, db, obs)
-		return opInsert, id, err
-	}
-	if err != nil {
-		return 0, 0, err
-	}
-	if existingHash == obs.ContentHash {
-		return opDuplicate, existingID, nil
-	}
-	// Revision path — handled in Task 7
-	return 0, 0, fmt.Errorf("revision not yet implemented")
-}
-
-func insertObservation(ctx context.Context, db *sql.DB, obs *capture.Observation) (int64, error) {
-	actors, err := json.Marshal(obs.Actors)
-	if err != nil {
-		return 0, fmt.Errorf("marshal actors: %w", err)
-	}
-	meta, err := json.Marshal(obs.Metadata)
-	if err != nil {
-		return 0, fmt.Errorf("marshal metadata: %w", err)
-	}
-	media, err := json.Marshal(obs.MediaRefs)
-	if err != nil {
-		return 0, fmt.Errorf("marshal media_refs: %w", err)
-	}
-	res, err := db.ExecContext(ctx, `
-		INSERT INTO observations
-		  (source_kind, source_id, content_hash, version, scope,
-		   captured_at, observed_at, actors, content_text, media_refs, metadata, raw_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		obs.SourceKind, obs.SourceID, obs.ContentHash, obs.Version, obs.Scope,
-		obs.CapturedAt.Format(time.RFC3339), obs.ObservedAt.Format(time.RFC3339),
-		string(actors), obs.ContentText, string(media), string(meta), string(obs.RawJSON),
-	)
-	if err != nil {
-		return 0, err
-	}
-	return res.LastInsertId()
-}
