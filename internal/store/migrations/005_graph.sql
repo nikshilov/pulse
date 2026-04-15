@@ -28,8 +28,8 @@ CREATE INDEX idx_identities_entity ON entity_identities(entity_id);
 -- Entity merge proposals (confidence-gated)
 CREATE TABLE entity_merge_proposals (
     id             INTEGER PRIMARY KEY,
-    from_entity_id INTEGER NOT NULL REFERENCES entities(id),
-    to_entity_id   INTEGER NOT NULL REFERENCES entities(id),
+    from_entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    to_entity_id   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
     confidence     REAL NOT NULL,
     evidence_md    TEXT NOT NULL,
     state          TEXT NOT NULL CHECK(state IN ('pending','approved','rejected','auto_merged')),
@@ -41,7 +41,7 @@ CREATE INDEX idx_merge_state ON entity_merge_proposals(state);
 
 -- Sensitive actors allowlist
 CREATE TABLE sensitive_actors (
-    entity_id   INTEGER PRIMARY KEY REFERENCES entities(id),
+    entity_id   INTEGER PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
     policy      TEXT NOT NULL CHECK(policy IN ('redact_content','summary_only','no_capture')),
     reason      TEXT,
     added_at    TEXT NOT NULL,

@@ -206,6 +206,39 @@ func TestMigration005Graph(t *testing.T) {
 	if count != 0 {
 		t.Errorf("expected cascade delete, got %d identities", count)
 	}
+
+	// CASCADE on entity_merge_proposals
+	var eaID, ebID int64
+	if err = db.QueryRow(`INSERT INTO entities (canonical_name, kind, first_seen, last_seen) VALUES ('a','person','2026-04-15T00:00:00Z','2026-04-15T00:00:00Z') RETURNING id`).Scan(&eaID); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(`INSERT INTO entities (canonical_name, kind, first_seen, last_seen) VALUES ('b','person','2026-04-15T00:00:00Z','2026-04-15T00:00:00Z') RETURNING id`).Scan(&ebID); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO entity_merge_proposals (from_entity_id, to_entity_id, confidence, evidence_md, state, proposed_at) VALUES (?,?,0.85,'test','pending','2026-04-15T00:00:00Z')`, eaID, ebID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM entities WHERE id=?`, eaID); err != nil {
+		t.Fatalf("entity with merge proposal should cascade-delete: %v", err)
+	}
+	db.QueryRow(`SELECT COUNT(*) FROM entity_merge_proposals WHERE from_entity_id=?`, eaID).Scan(&count)
+	if count != 0 {
+		t.Errorf("expected cascade on entity_merge_proposals, got %d", count)
+	}
+
+	// CASCADE on sensitive_actors
+	_, err = db.Exec(`INSERT INTO sensitive_actors (entity_id, policy, added_at, added_by) VALUES (?,'redact_content','2026-04-15T00:00:00Z','nik')`, ebID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM entities WHERE id=?`, ebID); err != nil {
+		t.Fatalf("entity with sensitive policy should cascade-delete: %v", err)
+	}
+	db.QueryRow(`SELECT COUNT(*) FROM sensitive_actors WHERE entity_id=?`, ebID).Scan(&count)
+	if count != 0 {
+		t.Errorf("expected cascade on sensitive_actors, got %d", count)
+	}
 }
 
 func TestSessionsFTSTriggersWork(t *testing.T) {
