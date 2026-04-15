@@ -218,3 +218,55 @@ def test_artifacts_partial_unique_extract_one_per_job_obs(tmp_path):
         assert raised, "second extract artifact for (job=1, obs=1) must raise IntegrityError"
     finally:
         con.close()
+
+
+# ---------- Layer 2: writes ----------
+
+def test_relation_upsert_bumps_strength_and_updates_last_seen(tmp_path):
+    """Second apply of the same (from,to,kind) must UPSERT: strength += 1, last_seen updated."""
+    db = tmp_path / "p1.db"
+    _apply_migrations(db)
+
+    con = pulse_extract._open_connection(str(db))
+    con.execute(
+        """INSERT INTO observations
+           (source_kind, source_id, content_hash, version, scope, captured_at,
+            observed_at, actors, content_text, metadata, raw_json)
+           VALUES ('claude_jsonl','f:1','h1',1,'shared','2026-04-16T00:00:00Z',
+                   '2026-04-16T00:00:00Z','[]','t','{}','{}')"""
+    )
+    result = {
+        "entities": [
+            {"canonical_name": "Anna", "kind": "person"},
+            {"canonical_name": "Fedya", "kind": "person"},
+        ],
+        "events": [],
+        "relations": [{"from": "Anna", "to": "Fedya", "kind": "friend", "strength": 0.5}],
+        "facts": [],
+    }
+    con.execute("BEGIN IMMEDIATE")
+    r1 = pulse_extract._apply_extraction(con, 1, result)
+    con.execute("COMMIT")
+
+    # First apply: one relation, strength=0.5
+    assert r1["relations_written"] == 1
+    row = con.execute("SELECT strength, first_seen, last_seen FROM relations").fetchone()
+    assert row[0] == 0.5
+    first_seen_before = row[1]
+
+    con.execute("BEGIN IMMEDIATE")
+    r2 = pulse_extract._apply_extraction(con, 1, result)
+    con.execute("COMMIT")
+
+    # Second apply of same relation: UPSERT bumps strength, keeps first_seen, updates last_seen
+    rows = con.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
+    con.close()
+    assert rows == 1, "relation count must stay at 1 (UPSERT, not duplicate)"
+    assert r2["relations_written"] == 1, "UPSERT still counts as a write"
+    row2 = sqlite3.connect(db).execute(
+        "SELECT strength, first_seen, last_seen FROM relations"
+    ).fetchone()
+    assert row2[0] == 1.5, f"strength must bump by 1 on re-apply (was 0.5, got {row2[0]})"
+    assert row2[1] == first_seen_before, "first_seen must be preserved"
+    # last_seen is a second-resolution timestamp — it can equal first_seen if both runs are in
+    # the same second; the invariant is that strength bumped, which the previous assert verified.

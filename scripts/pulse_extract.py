@@ -202,7 +202,11 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
         con.execute(f"SAVEPOINT {sp}")
         try:
             cur = con.execute(
-                "INSERT INTO relations (from_entity_id, to_entity_id, kind, strength, first_seen, last_seen) VALUES (?,?,?,?,?,?)",
+                """INSERT INTO relations (from_entity_id, to_entity_id, kind, strength, first_seen, last_seen)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(from_entity_id, to_entity_id, kind) DO UPDATE SET
+                       strength  = strength + 1,
+                       last_seen = excluded.last_seen""",
                 (from_id, to_id, rel.get("kind", ""), float(rel.get("strength", 0.0)), now, now),
             )
             con.execute(
