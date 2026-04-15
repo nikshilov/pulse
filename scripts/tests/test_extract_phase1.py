@@ -557,3 +557,102 @@ def test_restart_reuses_triage_artifact_no_sonnet_call(tmp_path, monkeypatch):
     state = con.execute("SELECT state FROM extraction_jobs WHERE id=1").fetchone()[0]
     con.close()
     assert state == "done", "skip-all-obs triage → done"
+
+
+def test_extract_artifact_saved_after_opus_call_per_obs(tmp_path, monkeypatch):
+    """After run_once on a 2-obs job, extract artifacts exist for each obs flagged 'extract'."""
+    db = tmp_path / "p1.db"
+    _apply_migrations(db)
+
+    con = sqlite3.connect(db)
+    for i in (1, 2):
+        con.execute(
+            """INSERT INTO observations(source_kind,source_id,content_hash,version,scope,captured_at,observed_at,actors,content_text,metadata,raw_json)
+               VALUES ('claude_jsonl',?,?,1,'shared','2026-04-16T00:00:00Z','2026-04-16T00:00:00Z','[]',?,'{}','{}')""",
+            (f"f:{i}", f"h{i}", f"t{i}"),
+        )
+    con.execute(
+        "INSERT INTO extraction_jobs(observation_ids,state,attempts,created_at,updated_at) VALUES ('[1,2]','pending',0,'2026-04-16T00:00:00Z','2026-04-16T00:00:00Z')"
+    )
+    con.commit()
+    con.close()
+
+    monkeypatch.setattr(
+        pulse_extract, "call_sonnet_triage",
+        lambda _p, expected_count: [{"verdict": "extract"} for _ in range(expected_count)],
+    )
+    call_ids: list = []
+
+    def fake_extract(_prompt):
+        call_ids.append(len(call_ids) + 1)
+        return {
+            "entities": [{"canonical_name": f"E{len(call_ids)}", "kind": "person"}],
+            "events": [], "relations": [], "facts": [],
+        }
+
+    monkeypatch.setattr(pulse_extract, "call_opus_extract", fake_extract)
+
+    pulse_extract.run_once(str(db))
+
+    con = sqlite3.connect(db)
+    rows = con.execute(
+        "SELECT obs_id FROM extraction_artifacts WHERE job_id=1 AND kind='extract' ORDER BY obs_id"
+    ).fetchall()
+    con.close()
+    assert [r[0] for r in rows] == [1, 2], "one extract artifact per obs"
+    assert len(call_ids) == 2, "Opus called once per obs on fresh run"
+
+
+def test_restart_reuses_extract_artifact_per_obs(tmp_path, monkeypatch):
+    """If an extract artifact exists for obs 1, Opus must not be called for obs 1 on replay."""
+    db = tmp_path / "p1.db"
+    _apply_migrations(db)
+
+    con = sqlite3.connect(db)
+    for i in (1, 2):
+        con.execute(
+            """INSERT INTO observations(source_kind,source_id,content_hash,version,scope,captured_at,observed_at,actors,content_text,metadata,raw_json)
+               VALUES ('claude_jsonl',?,?,1,'shared','2026-04-16T00:00:00Z','2026-04-16T00:00:00Z','[]',?,'{}','{}')""",
+            (f"f:{i}", f"h{i}", f"t{i}"),
+        )
+    con.execute(
+        "INSERT INTO extraction_jobs(observation_ids,state,attempts,created_at,updated_at) VALUES ('[1,2]','pending',0,'2026-04-16T00:00:00Z','2026-04-16T00:00:00Z')"
+    )
+    con.execute(
+        "INSERT INTO extraction_artifacts(job_id,kind,obs_id,payload_json,model) "
+        "VALUES (1,'triage',NULL,'[{\"verdict\":\"extract\"},{\"verdict\":\"extract\"}]','sonnet-cached')"
+    )
+    con.execute(
+        "INSERT INTO extraction_artifacts(job_id,kind,obs_id,payload_json,model) "
+        "VALUES (1,'extract',1,?,'opus-cached')",
+        (json.dumps({"entities": [{"canonical_name": "Cached1", "kind": "person"}],
+                     "events": [], "relations": [], "facts": []}),),
+    )
+    con.commit()
+    con.close()
+
+    monkeypatch.setattr(pulse_extract, "call_sonnet_triage",
+                        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("no triage expected")))
+    opus_calls: list = []
+
+    def fake_opus(_prompt):
+        opus_calls.append(_prompt)
+        return {
+            "entities": [{"canonical_name": "Fresh2", "kind": "person"}],
+            "events": [], "relations": [], "facts": [],
+        }
+
+    monkeypatch.setattr(pulse_extract, "call_opus_extract", fake_opus)
+
+    pulse_extract.run_once(str(db))
+
+    assert len(opus_calls) == 1, (
+        f"Opus must be called only for obs 2 (obs 1 was cached); got {len(opus_calls)} calls"
+    )
+
+    con = sqlite3.connect(db)
+    names = {r[0] for r in con.execute("SELECT canonical_name FROM entities")}
+    con.close()
+    assert names == {"Cached1", "Fresh2"}, (
+        "obs 1 entity comes from cached artifact, obs 2 from fresh Opus call"
+    )

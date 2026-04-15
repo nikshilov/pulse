@@ -370,9 +370,12 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
                 for obs, v in zip(observations, verdicts):
                     if v["verdict"] != "extract":
                         continue
-                    graph_ctx = {"existing_entities": _load_existing_entities(con)}
-                    extract_prompt = prompts.build_extract_prompt(obs, graph_ctx)
-                    result = call_opus_extract(extract_prompt)
+                    result = _get_artifact(con, job_id, "extract", obs["id"])
+                    if result is None:
+                        graph_ctx = {"existing_entities": _load_existing_entities(con)}
+                        extract_prompt = prompts.build_extract_prompt(obs, graph_ctx)
+                        result = call_opus_extract(extract_prompt)
+                        _save_artifact(con, job_id, "extract", obs["id"], result, EXTRACT_MODEL)
 
                     con.execute("BEGIN IMMEDIATE")
                     try:
@@ -384,6 +387,7 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
                         job_reports.append({
                             "obs_id": obs["id"],
                             "entities_written": 0, "events_written": 0,
+                            "event_entities_written": 0,
                             "relations_written": 0, "facts_written": 0,
                             "failed_items": [{
                                 "item_kind": "whole_obs",
