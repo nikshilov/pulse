@@ -356,8 +356,11 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
                 continue
 
             try:
-                triage_prompt = prompts.build_triage_prompt(observations)
-                verdicts = call_sonnet_triage(triage_prompt, expected_count=len(observations))
+                verdicts = _get_artifact(con, job_id, "triage", None)
+                if verdicts is None:
+                    triage_prompt = prompts.build_triage_prompt(observations)
+                    verdicts = call_sonnet_triage(triage_prompt, expected_count=len(observations))
+                    _save_artifact(con, job_id, "triage", None, verdicts, TRIAGE_MODEL)
                 job_reports: list[dict] = []
 
                 if len(verdicts) != len(observations):
