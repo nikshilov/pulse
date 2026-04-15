@@ -1978,3 +1978,40 @@ Before dispatching the first subagent, verify:
 **Migration ordering:** 006 appears alphabetically after 005_graph.sql in `internal/store/migrations/` — `sorted(MIGRATIONS.glob("*.sql"))` applies them in order.
 
 **Phase 0 regression:** existing Phase 0 tests in `test_extract_phase0.py` exercised after each task. Widening `except` to Exception preserves existing behavior because `sqlite3.Error < Exception`. Adding UNIQUEs does not affect Phase 0 tests because none of them write duplicate relations or facts.
+
+---
+
+## Phase 1 validation (Task 12)
+
+**Date:** 2026-04-16
+**Smoke DB:** `/tmp/pulse-phase1-smoke.db` (copy of `pulse-dev/pulse.db`)
+
+**Full pytest suite:** 60 passed, 1 skipped (pre-existing live-API ingest skip — `test_integration_claude_jsonl.py::test_ingest_e2e`)
+
+**Pre-migration audit (after 006 applied):** `relations duplicates: 0 / facts duplicates: 0 / OK: no duplicates, safe to migrate`
+
+**Migration 006:** applied cleanly
+
+**First extraction run (budget=$1):**
+- Exit code: 0
+- Jobs state before: pending 9614, done 9 → after: pending 9604, done 19 (10 newly processed)
+- Tracebacks in output: none
+- `event_entities_written` present in apply_report output: yes (key present in job 1's per-obs report, value 0 — all entity items had empty canonical_name from LLM and were caught to `failed_items`)
+- Artifacts table after run 1: triage 10, extract 1 (job 1 reached Opus extraction; jobs 11-19 had empty triage payload — apply_report=[])
+- event_entities rows: 0 (job 1's LLM response returned entities with empty canonical_name and kind; all caught safely to `failed_items` via widened KeyError catch, no escape traceback)
+- failed_items detail: `{"item_kind": "entity", "reason": "KeyError: 'canonical_name'", "detail": {"index": N, "canonical_name": "", "kind": ""}}` — savepoint isolation preserved obs-level tx boundary
+
+**Second extraction run (idempotency check):**
+- Exit code: 0
+- Artifacts table delta: triage +10 (new jobs 20-29), extract +0 (job 1 not re-processed)
+- DB state delta: done 19 → 29, pending 9604 → 9594; jobs 1-19 (done in run 1) not touched — checkpoint working correctly
+
+**Phase 0 invariants preserved:**
+- Per-obs tx boundary: yes — no escape tracebacks; each obs wrapped in savepoint
+- Savepoint isolation: yes — confirmed by Phase 0 regression tests (all 8 passing)
+- Widened except catches: observed — `KeyError: 'canonical_name'` caught to `failed_items` on real data (LLM returned empty-string entity fields); no malformed responses escaped as Python tracebacks
+
+**Follow-ups surfaced:**
+1. Job 1 LLM response returned entities with empty `canonical_name` and `kind` fields — these are caught safely but produce 0 writes. Worth investigating whether the Opus extract prompt needs stricter output instructions or a post-parse validation step to reject blank canonical names before savepoint processing.
+2. Jobs 11-19 had `apply_report=[]` — triage verdict was likely `skip` for all observations. Real claude_jsonl (code tasks) are expected to triage-skip, consistent with Phase 0 notes. No action needed.
+3. Budget consumed: ~$1 processed only 10 jobs out of 9623 (one Opus call for job 1 + 19 Sonnet triage calls). Real-data throughput will require higher budget or batched runs.
