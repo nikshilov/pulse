@@ -1,4 +1,35 @@
+# Go
 /bin/
+*.exe
+*.test
+*.out
+vendor/
+
+# SQLite / DB
 *.db
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite3
+
+# Secrets
+.env
+.env.local
+*.key
+secrets/
+*.session
+*-session.session
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Python (for scripts/)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Large raw response dumps (keep brief .md, drop the JSON dumps)
+elle-prompt-raw-response.json
