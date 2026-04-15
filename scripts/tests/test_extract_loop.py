@@ -70,3 +70,15 @@ def test_failed_job_moves_to_dlq_after_three_attempts(seeded_db, monkeypatch):
     con = sqlite3.connect(seeded_db)
     state = con.execute("SELECT state FROM extraction_jobs WHERE id=1").fetchone()[0]
     assert state == "dlq"
+
+
+def test_budget_exhausted_skips_extraction(seeded_db, capsys):
+    import pulse_extract
+    rc = pulse_extract.run_once(str(seeded_db), budget_usd_remaining=0.0)
+    captured = capsys.readouterr()
+    assert "budget" in captured.out.lower()
+
+    con = sqlite3.connect(seeded_db)
+    # Job should remain pending, NOT be moved to running/failed
+    state = con.execute("SELECT state FROM extraction_jobs WHERE id=1").fetchone()[0]
+    assert state == "pending"

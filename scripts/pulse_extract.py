@@ -96,6 +96,11 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
     con = sqlite3.connect(db_path)
     con.execute("PRAGMA foreign_keys=ON")
 
+    if budget_usd_remaining <= 0:
+        print("budget exhausted for today — skipping extraction run")
+        con.close()
+        return 0
+
     jobs = con.execute("SELECT id, observation_ids FROM extraction_jobs WHERE state='pending' ORDER BY created_at LIMIT 10").fetchall()
     if not jobs:
         print("no pending jobs")
