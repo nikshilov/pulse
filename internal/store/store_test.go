@@ -33,8 +33,8 @@ func TestOpenCreatesSchema(t *testing.T) {
 	if err := db.QueryRow("SELECT MAX(version) FROM schema_meta").Scan(&version); err != nil {
 		t.Fatalf("schema_meta: %v", err)
 	}
-	if version != 2 {
-		t.Errorf("expected schema version 2, got %d", version)
+	if version != 3 {
+		t.Errorf("expected schema version 3, got %d", version)
 	}
 }
 
@@ -54,8 +54,8 @@ func TestOpenIsIdempotent(t *testing.T) {
 	if err := db2.QueryRow("SELECT MAX(version) FROM schema_meta").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 {
-		t.Errorf("expected still at version 2, got %d", version)
+	if version != 3 {
+		t.Errorf("expected still at version 3, got %d", version)
 	}
 }
 
@@ -92,13 +92,45 @@ func TestContextSchemaApplied(t *testing.T) {
 		t.Error("expected sessions_fts virtual table")
 	}
 
-	// Migration version bumped to 2.
+	// Migration version bumped to 3 (003_observations added).
 	var version int
 	if err := db.QueryRow("SELECT MAX(version) FROM schema_meta").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 {
-		t.Errorf("expected schema version 2, got %d", version)
+	if version != 3 {
+		t.Errorf("expected schema version 3, got %d", version)
+	}
+}
+
+func TestMigration003Observations(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	// All tables should exist after migration
+	for _, table := range []string{"observations", "observation_revisions", "provider_cursors", "erasure_log"} {
+		var name string
+		err := db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&name)
+		if err != nil {
+			t.Errorf("table %s missing: %v", table, err)
+		}
+	}
+
+	// UNIQUE constraint on (source_kind, source_id, version)
+	_, err = db.Exec(`INSERT INTO observations
+        (source_kind, source_id, content_hash, version, scope, captured_at, observed_at, actors, content_text, metadata, raw_json)
+        VALUES ('tg','m:1','h1',1,'nik','2026-04-15T00:00:00Z','2026-04-15T00:00:00Z','[]','hello','{}','{}')`)
+	if err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO observations
+        (source_kind, source_id, content_hash, version, scope, captured_at, observed_at, actors, content_text, metadata, raw_json)
+        VALUES ('tg','m:1','h1',1,'nik','2026-04-15T00:00:00Z','2026-04-15T00:00:00Z','[]','hello','{}','{}')`)
+	if err == nil {
+		t.Fatal("expected UNIQUE violation, got nil")
 	}
 }
 
