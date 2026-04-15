@@ -100,6 +100,28 @@ func TestIngestDedupsIdenticalHash(t *testing.T) {
 	}
 }
 
+func TestIngestEnqueuesExtractionJob(t *testing.T) {
+	s := openTestStore(t)
+	h := NewHandler(s)
+
+	obs := capture.Observation{
+		SourceKind: "tg", SourceID: "m:99", ContentHash: "h1", Version: 1,
+		Scope:      "nik",
+		CapturedAt: timeParse(t, "2026-04-15T00:00:00Z"),
+		ObservedAt: timeParse(t, "2026-04-15T00:00:01Z"),
+		Actors:     []capture.ActorRef{{Kind: "tg_user", ID: "123"}},
+		ContentText: "meaningful",
+	}
+	body, _ := json.Marshal(map[string]any{"observations": []capture.Observation{obs}})
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewReader(body)))
+
+	var jobCount int
+	s.DB().QueryRow(`SELECT COUNT(*) FROM extraction_jobs WHERE state='pending'`).Scan(&jobCount)
+	if jobCount != 1 {
+		t.Errorf("expected 1 pending job, got %d", jobCount)
+	}
+}
+
 func TestIngestRevisionOnHashChange(t *testing.T) {
 	s := openTestStore(t)
 	h := NewHandler(s)
