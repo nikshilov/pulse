@@ -7,11 +7,12 @@ import (
 
 func TestOpenCreatesSchema(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	db, err := Open(dbPath)
+	s, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	defer db.Close()
+	defer s.Close()
+	db := s.DB()
 
 	var journalMode string
 	if err := db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
@@ -40,18 +41,18 @@ func TestOpenCreatesSchema(t *testing.T) {
 
 func TestOpenIsIdempotent(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	db1, err := Open(dbPath)
+	s1, err := Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	db1.Close()
-	db2, err := Open(dbPath)
+	s1.Close()
+	s2, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("second open failed: %v", err)
 	}
-	defer db2.Close()
+	defer s2.Close()
 	var version int
-	if err := db2.QueryRow("SELECT MAX(version) FROM schema_meta").Scan(&version); err != nil {
+	if err := s2.DB().QueryRow("SELECT MAX(version) FROM schema_meta").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
 	if version != 5 {
@@ -61,11 +62,12 @@ func TestOpenIsIdempotent(t *testing.T) {
 
 func TestContextSchemaApplied(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	db, err := Open(dbPath)
+	s, err := Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer s.Close()
+	db := s.DB()
 
 	// All five context tables exist.
 	for _, table := range []string{"sessions", "messages", "memory_snapshots", "compaction_events", "pending_promotions"} {
@@ -104,11 +106,12 @@ func TestContextSchemaApplied(t *testing.T) {
 
 func TestMigration003Observations(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"))
+	s, err := Open(filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer db.Close()
+	defer s.Close()
+	db := s.DB()
 
 	// All tables should exist after migration
 	for _, table := range []string{"observations", "observation_revisions", "provider_cursors", "erasure_log"} {
@@ -136,11 +139,12 @@ func TestMigration003Observations(t *testing.T) {
 
 func TestMigration004ExtractionJobs(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"))
+	s, err := Open(filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer db.Close()
+	defer s.Close()
+	db := s.DB()
 
 	_, err = db.Exec(`INSERT INTO extraction_jobs
         (observation_ids, state, attempts, created_at, updated_at)
@@ -169,11 +173,12 @@ func TestMigration004ExtractionJobs(t *testing.T) {
 
 func TestMigration005Graph(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"))
+	s, err := Open(filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer db.Close()
+	defer s.Close()
+	db := s.DB()
 
 	tables := []string{
 		"entities", "entity_identities", "relations", "facts", "events",
@@ -243,11 +248,12 @@ func TestMigration005Graph(t *testing.T) {
 
 func TestSessionsFTSTriggersWork(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	db, err := Open(dbPath)
+	s, err := Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer s.Close()
+	db := s.DB()
 
 	// Insert a session — FTS5 insert trigger should fire.
 	_, err = db.Exec(`
