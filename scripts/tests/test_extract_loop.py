@@ -82,3 +82,83 @@ def test_budget_exhausted_skips_extraction(seeded_db, capsys):
     # Job should remain pending, NOT be moved to running/failed
     state = con.execute("SELECT state FROM extraction_jobs WHERE id=1").fetchone()[0]
     assert state == "pending"
+
+
+def test_relations_and_facts_persisted(seeded_db, monkeypatch):
+    from unittest.mock import MagicMock
+    import sqlite3
+    import pulse_extract
+
+    fake_triage = MagicMock(return_value=[{"verdict": "extract", "reason": "family"}])
+    fake_extract = MagicMock(return_value={
+        "entities": [
+            {"canonical_name": "Anna", "kind": "person", "aliases": ["Аня"], "salience": 0.9, "emotional_weight": 0.8},
+            {"canonical_name": "Fedya", "kind": "person", "aliases": ["Федя"], "salience": 0.5, "emotional_weight": 0.3},
+        ],
+        "relations": [
+            {"from": "Anna", "to": "Fedya", "kind": "parent", "strength": 0.9},
+        ],
+        "facts": [
+            {"entity": "Anna", "text": "Anna is Fedya's mother", "confidence": 0.95},
+            {"entity": "Fedya", "text": "Fedya started school in 2025", "confidence": 0.8},
+        ],
+        "events": [],
+        "merge_candidates": [],
+    })
+    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", fake_triage)
+    monkeypatch.setattr(pulse_extract, "call_opus_extract", fake_extract)
+
+    pulse_extract.run_once(str(seeded_db))
+
+    con = sqlite3.connect(seeded_db)
+    # Relation resolved and stored
+    rel = con.execute("SELECT from_entity_id, to_entity_id, kind, strength FROM relations").fetchone()
+    assert rel is not None, "no relation persisted"
+    anna_id = con.execute("SELECT id FROM entities WHERE canonical_name='Anna'").fetchone()[0]
+    fedya_id = con.execute("SELECT id FROM entities WHERE canonical_name='Fedya'").fetchone()[0]
+    assert rel[0] == anna_id
+    assert rel[1] == fedya_id
+    assert rel[2] == "parent"
+    assert rel[3] == 0.9
+
+    # Facts resolved to entities
+    facts = con.execute("SELECT entity_id, text, confidence FROM facts ORDER BY id").fetchall()
+    assert len(facts) == 2
+    assert facts[0][0] == anna_id
+    assert facts[0][1] == "Anna is Fedya's mother"
+    assert facts[1][0] == fedya_id
+
+
+def test_unknown_entity_reference_is_skipped(seeded_db, monkeypatch, capsys):
+    from unittest.mock import MagicMock
+    import sqlite3
+    import pulse_extract
+
+    fake_triage = MagicMock(return_value=[{"verdict": "extract", "reason": "family"}])
+    fake_extract = MagicMock(return_value={
+        "entities": [
+            {"canonical_name": "Anna", "kind": "person", "aliases": [], "salience": 0.9, "emotional_weight": 0.8},
+        ],
+        "relations": [
+            {"from": "Anna", "to": "Ghost", "kind": "knows", "strength": 0.5},
+        ],
+        "facts": [
+            {"entity": "Nobody", "text": "irrelevant", "confidence": 0.9},
+        ],
+        "events": [],
+        "merge_candidates": [],
+    })
+    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", fake_triage)
+    monkeypatch.setattr(pulse_extract, "call_opus_extract", fake_extract)
+
+    pulse_extract.run_once(str(seeded_db))
+
+    con = sqlite3.connect(seeded_db)
+    # No relation or fact because both referenced unknown entities
+    assert con.execute("SELECT COUNT(*) FROM relations").fetchone()[0] == 0
+    assert con.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
+    # But Anna itself was still persisted
+    assert con.execute("SELECT COUNT(*) FROM entities WHERE canonical_name='Anna'").fetchone()[0] == 1
+
+    captured = capsys.readouterr()
+    assert "skipping relation" in captured.out.lower() or "unknown entity" in captured.out.lower()

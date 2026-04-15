@@ -51,6 +51,9 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> Non
     existing = _load_existing_entities(con)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+    # name_to_id: canonical_name + all aliases → entity_id
+    name_to_id: dict[str, int] = {}
+
     for ent in result.get("entities", []):
         dec = resolver.resolve_entity(ent, existing)
         scored = scorer.score_entity(ent)
@@ -83,12 +86,51 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> Non
         con.execute("INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('entity',?,?,?)",
                     (entity_id, obs_id, now))
 
+        # Register canonical name and all aliases in the lookup map
+        name_to_id[ent["canonical_name"]] = entity_id
+        for alias in (ent.get("aliases") or []):
+            name_to_id[alias] = entity_id
+
     # events
     for ev in result.get("events", []):
         s = scorer.score_event(ev)
         cur = con.execute("INSERT INTO events (title, description, sentiment, emotional_weight, scorer_version, ts) VALUES (?,?,?,?,?,?)",
                           (ev.get("title",""), ev.get("description",""), s["sentiment"], s["emotional_weight"], s["scorer_version"], ev.get("ts", now)))
         con.execute("INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('event',?,?,?)",
+                    (cur.lastrowid, obs_id, now))
+
+    # relations
+    for rel in result.get("relations", []):
+        from_name = rel.get("from", "")
+        to_name = rel.get("to", "")
+        from_id = name_to_id.get(from_name)
+        to_id = name_to_id.get(to_name)
+        if from_id is None:
+            print(f"skipping relation: unknown entity '{from_name}'")
+            continue
+        if to_id is None:
+            print(f"skipping relation: unknown entity '{to_name}'")
+            continue
+        cur = con.execute(
+            "INSERT INTO relations (from_entity_id, to_entity_id, kind, strength, first_seen, last_seen) VALUES (?,?,?,?,?,?)",
+            (from_id, to_id, rel.get("kind", ""), float(rel.get("strength", 0.0)), now, now),
+        )
+        con.execute("INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('relation',?,?,?)",
+                    (cur.lastrowid, obs_id, now))
+
+    # facts
+    for fact in result.get("facts", []):
+        entity_name = fact.get("entity", "")
+        entity_id = name_to_id.get(entity_name)
+        if entity_id is None:
+            print(f"skipping fact: unknown entity '{entity_name}'")
+            continue
+        scored = scorer.score_fact(fact)
+        cur = con.execute(
+            "INSERT INTO facts (entity_id, text, confidence, scorer_version, created_at) VALUES (?,?,?,?,?)",
+            (entity_id, fact.get("text", ""), scored["confidence"], scored["scorer_version"], now),
+        )
+        con.execute("INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('fact',?,?,?)",
                     (cur.lastrowid, obs_id, now))
 
 
