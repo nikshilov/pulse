@@ -37,7 +37,7 @@ def test_e2e_extraction_creates_graph(tmp_path, monkeypatch):
     fixtures = json.loads(FIXTURES.read_text())
     db = _seed(tmp_path)
 
-    def fake_triage(_prompt):
+    def fake_triage(*_args, **_kwargs):
         return prompts.parse_triage_response(fixtures["triage"], expected_count=2)
 
     def fake_extract(_prompt):

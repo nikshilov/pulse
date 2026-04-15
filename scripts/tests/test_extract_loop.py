@@ -129,6 +129,61 @@ def test_relations_and_facts_persisted(seeded_db, monkeypatch):
     assert facts[1][0] == fedya_id
 
 
+def test_call_sonnet_triage_uses_anthropic_client(monkeypatch):
+    import pulse_extract
+    from unittest.mock import MagicMock
+
+    fake_message = MagicMock()
+    fake_message.content = [MagicMock(text="1. extract — real\n2. skip — trivial")]
+
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = fake_message
+
+    monkeypatch.setattr(pulse_extract, "_anthropic_client", lambda: fake_client)
+
+    out = pulse_extract.call_sonnet_triage("some prompt", expected_count=2)
+    assert len(out) == 2
+    assert out[0]["verdict"] == "extract"
+    assert out[1]["verdict"] == "skip"
+
+    # model id sanity
+    args, kwargs = fake_client.messages.create.call_args
+    assert kwargs["model"] == "claude-sonnet-4-6"
+
+
+def test_call_opus_extract_uses_anthropic_client(monkeypatch):
+    import pulse_extract
+    from unittest.mock import MagicMock
+
+    fake_message = MagicMock()
+    fake_message.content = [MagicMock(text='{"entities":[{"canonical_name":"X","kind":"person","aliases":[],"salience":0.5,"emotional_weight":0.5}],"relations":[],"events":[],"facts":[],"merge_candidates":[]}')]
+
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = fake_message
+
+    monkeypatch.setattr(pulse_extract, "_anthropic_client", lambda: fake_client)
+
+    out = pulse_extract.call_opus_extract("prompt")
+    assert out["entities"][0]["canonical_name"] == "X"
+
+    args, kwargs = fake_client.messages.create.call_args
+    assert kwargs["model"] == "claude-opus-4-6"
+
+
+def test_anthropic_api_key_missing_raises_clear_error(monkeypatch):
+    import pulse_extract
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # Reset cached client if any
+    if hasattr(pulse_extract, "_client_cache"):
+        pulse_extract._client_cache = None
+    try:
+        pulse_extract._anthropic_client()
+    except RuntimeError as e:
+        assert "ANTHROPIC_API_KEY" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
 def test_unknown_entity_reference_is_skipped(seeded_db, monkeypatch, capsys):
     from unittest.mock import MagicMock
     import sqlite3
