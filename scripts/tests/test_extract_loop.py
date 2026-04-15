@@ -54,3 +54,19 @@ def test_extract_loop_processes_pending(seeded_db, monkeypatch):
     # Job marked done
     state = con.execute("SELECT state FROM extraction_jobs WHERE id=1").fetchone()[0]
     assert state == "done"
+
+
+def test_failed_job_moves_to_dlq_after_three_attempts(seeded_db, monkeypatch):
+    import pulse_extract
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("triage API down")
+
+    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", boom)
+
+    for _ in range(3):
+        pulse_extract.run_once(str(seeded_db))
+
+    con = sqlite3.connect(seeded_db)
+    state = con.execute("SELECT state FROM extraction_jobs WHERE id=1").fetchone()[0]
+    assert state == "dlq"

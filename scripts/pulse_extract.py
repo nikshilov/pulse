@@ -130,8 +130,11 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
                         (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), job_id))
             con.commit()
         except Exception as e:
-            con.execute("UPDATE extraction_jobs SET state='failed', last_error=?, updated_at=? WHERE id=?",
-                        (str(e)[:500], time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), job_id))
+            attempts_row = con.execute("SELECT attempts FROM extraction_jobs WHERE id=?", (job_id,)).fetchone()
+            attempts = attempts_row[0] if attempts_row else 0
+            next_state = "dlq" if attempts >= 3 else "pending"  # pending → retry on next run
+            con.execute("UPDATE extraction_jobs SET state=?, last_error=?, updated_at=? WHERE id=?",
+                        (next_state, str(e)[:500], time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), job_id))
             con.commit()
 
     con.close()
