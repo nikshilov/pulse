@@ -1,0 +1,17 @@
+{
+  "triage": "1. extract — mentions family\n2. skip — trivial greeting",
+  "extract_1": {
+    "entities": [
+      {"canonical_name": "Anna", "kind": "person", "aliases": ["Аня"], "salience": 0.95, "emotional_weight": 0.9},
+      {"canonical_name": "Fedya", "kind": "person", "aliases": ["Федя"], "salience": 0.6, "emotional_weight": 0.4}
+    ],
+    "relations": [
+      {"from": "Anna", "to": "Fedya", "kind": "parent", "strength": 0.9}
+    ],
+    "events": [
+      {"title": "Fedya started school", "sentiment": 0.6, "emotional_weight": 0.5, "ts": "2025-09-01T08:00:00Z", "entities": ["Fedya"]}
+    ],
+    "facts": [],
+    "merge_candidates": []
+  }
+}
