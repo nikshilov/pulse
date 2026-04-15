@@ -72,18 +72,25 @@ CREATE TABLE extraction_artifacts (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id       INTEGER NOT NULL REFERENCES extraction_jobs(id) ON DELETE CASCADE,
   kind         TEXT NOT NULL CHECK (kind IN ('triage','extract')),
-  obs_id       TEXT,  -- NULL for kind='triage' (covers whole job), set for kind='extract' (per-obs)
+  obs_id       INTEGER REFERENCES observations(id) ON DELETE CASCADE,  -- NULL for kind='triage'
   payload_json TEXT NOT NULL,
   model        TEXT NOT NULL,
-  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  UNIQUE (job_id, kind, obs_id)
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+-- One triage artifact per job; one extract artifact per (job, obs).
+-- Partial indices are used because SQLite treats NULLs as distinct in
+-- composite UNIQUEs, so a plain UNIQUE(job_id,kind,obs_id) would allow
+-- duplicate triage rows with obs_id=NULL.
+CREATE UNIQUE INDEX idx_artifacts_triage_unique ON extraction_artifacts(job_id)
+  WHERE kind = 'triage';
+CREATE UNIQUE INDEX idx_artifacts_extract_unique ON extraction_artifacts(job_id, obs_id)
+  WHERE kind = 'extract';
 CREATE INDEX idx_artifacts_job ON extraction_artifacts(job_id, kind);
 ```
 
 **Rationale for each choice:**
-- **`(job_id, kind, obs_id)` unique** — checkpoint is per-job per-stage per-observation; a given obs should have exactly one artifact for each kind. Prevents duplicate saves on retry.
-- **`obs_id TEXT`** — observations have composite identity (`source_kind + source_id + version`); the job's `observation_ids` field is already serialized as a string list. Use the same id form here rather than introducing an INTEGER FK.
+- **`obs_id INTEGER` FK to `observations(id)`** — observation IDs are integers throughout (observations.id is INTEGER PRIMARY KEY; extraction_jobs.observation_ids is a JSON array of ints). FK with CASCADE means erasure of an observation removes its artifact automatically.
+- **Partial UNIQUE indices** — one triage artifact per job, one extract artifact per (job, obs). A plain composite UNIQUE would break for triage because SQLite treats NULLs as distinct.
 - **`ON DELETE CASCADE`** — erasure path (GDPR) deletes an entity; its junction rows and artifacts should go with it. Job deletion cleans up its artifacts.
 - **`payload_json`** — raw LLM response (verdicts for triage, entities/events/relations/facts for extract). Keeping raw means Phase 2's tool-use schema migration can re-validate old artifacts without re-calling LLM.
 
