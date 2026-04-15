@@ -305,3 +305,117 @@ def test_fact_insert_or_ignore_is_noop_on_duplicate(tmp_path):
     con.close()
     assert rows == 1, "fact must not be duplicated"
     assert failed == [], "duplicate must be silent, not a failed_item"
+
+
+def test_event_entities_junction_writes_resolved_names(tmp_path):
+    """Event with entities_involved=['Anna','Fedya'] must produce 2 junction rows."""
+    db = tmp_path / "p1.db"
+    _apply_migrations(db)
+
+    con = pulse_extract._open_connection(str(db))
+    con.execute(
+        """INSERT INTO observations
+           (source_kind, source_id, content_hash, version, scope, captured_at,
+            observed_at, actors, content_text, metadata, raw_json)
+           VALUES ('claude_jsonl','f:1','h1',1,'shared','2026-04-16T00:00:00Z',
+                   '2026-04-16T00:00:00Z','[]','t','{}','{}')"""
+    )
+    result = {
+        "entities": [
+            {"canonical_name": "Anna", "kind": "person"},
+            {"canonical_name": "Fedya", "kind": "person"},
+        ],
+        "events": [{
+            "title": "coffee",
+            "description": "morning coffee together",
+            "sentiment": 0.5, "emotional_weight": 0.3,
+            "entities_involved": ["Anna", "Fedya"],
+        }],
+        "relations": [],
+        "facts": [],
+    }
+    con.execute("BEGIN IMMEDIATE")
+    report = pulse_extract._apply_extraction(con, 1, result)
+    con.execute("COMMIT")
+
+    junction_rows = con.execute(
+        "SELECT event_id, entity_id FROM event_entities ORDER BY entity_id"
+    ).fetchall()
+    con.close()
+    assert len(junction_rows) == 2
+    assert {r[1] for r in junction_rows} == {1, 2}  # entity IDs 1 and 2
+    assert report["events_written"] == 1
+    assert report["event_entities_written"] == 2
+
+
+def test_event_with_partial_resolution_writes_only_resolved(tmp_path):
+    """Event names ['Anna','Ghost']: 'Ghost' unresolved → event written, 1 junction row, no failure."""
+    db = tmp_path / "p1.db"
+    _apply_migrations(db)
+
+    con = pulse_extract._open_connection(str(db))
+    con.execute(
+        """INSERT INTO observations
+           (source_kind, source_id, content_hash, version, scope, captured_at,
+            observed_at, actors, content_text, metadata, raw_json)
+           VALUES ('claude_jsonl','f:1','h1',1,'shared','2026-04-16T00:00:00Z',
+                   '2026-04-16T00:00:00Z','[]','t','{}','{}')"""
+    )
+    result = {
+        "entities": [{"canonical_name": "Anna", "kind": "person"}],
+        "events": [{
+            "title": "meeting", "description": "", "sentiment": 0.0, "emotional_weight": 0.1,
+            "entities_involved": ["Anna", "Ghost"],
+        }],
+        "relations": [],
+        "facts": [],
+    }
+    con.execute("BEGIN IMMEDIATE")
+    report = pulse_extract._apply_extraction(con, 1, result)
+    con.execute("COMMIT")
+
+    junction_rows = con.execute("SELECT entity_id FROM event_entities").fetchall()
+    con.close()
+    assert len(junction_rows) == 1
+    assert junction_rows[0][0] == 1
+    assert report["events_written"] == 1
+    assert report["event_entities_written"] == 1
+
+
+def test_event_with_all_unresolved_entities_fails(tmp_path):
+    """Event names ['Ghost','Phantom']: all unresolved → event dropped, not written, failed_items has reason."""
+    db = tmp_path / "p1.db"
+    _apply_migrations(db)
+
+    con = pulse_extract._open_connection(str(db))
+    con.execute(
+        """INSERT INTO observations
+           (source_kind, source_id, content_hash, version, scope, captured_at,
+            observed_at, actors, content_text, metadata, raw_json)
+           VALUES ('claude_jsonl','f:1','h1',1,'shared','2026-04-16T00:00:00Z',
+                   '2026-04-16T00:00:00Z','[]','t','{}','{}')"""
+    )
+    result = {
+        "entities": [{"canonical_name": "Anna", "kind": "person"}],
+        "events": [{
+            "title": "ghost_event", "description": "", "sentiment": 0.0, "emotional_weight": 0.1,
+            "entities_involved": ["Ghost", "Phantom"],
+        }],
+        "relations": [],
+        "facts": [],
+    }
+    con.execute("BEGIN IMMEDIATE")
+    report = pulse_extract._apply_extraction(con, 1, result)
+    con.execute("COMMIT")
+
+    ev_count = con.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    junction_count = con.execute("SELECT COUNT(*) FROM event_entities").fetchone()[0]
+    con.close()
+    assert ev_count == 0
+    assert junction_count == 0
+    assert report["events_written"] == 0
+    assert report["event_entities_written"] == 0
+    failures = [f for f in report["failed_items"]
+                if f["item_kind"] == "event" and f["reason"] == "all_entities_involved_unresolved"]
+    assert len(failures) == 1
+    assert failures[0]["detail"]["title"] == "ghost_event"

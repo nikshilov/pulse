@@ -105,6 +105,7 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
         "obs_id": obs_id,
         "entities_written": 0,
         "events_written": 0,
+        "event_entities_written": 0,
         "relations_written": 0,
         "facts_written": 0,
         "failed_items": [],
@@ -172,6 +173,13 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
         if not involved:
             _item_failure("event", "orphan_event_no_entities_involved", {"title": ev.get("title", "")})
             continue
+        resolved_entity_ids = [name_to_id[n] for n in involved if n in name_to_id]
+        if not resolved_entity_ids:
+            _item_failure(
+                "event", "all_entities_involved_unresolved",
+                {"index": idx, "title": ev.get("title", ""), "names": involved},
+            )
+            continue
         sp = f"ev_{idx}"
         con.execute(f"SAVEPOINT {sp}")
         try:
@@ -180,9 +188,16 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
                 "INSERT INTO events (title, description, sentiment, emotional_weight, scorer_version, ts) VALUES (?,?,?,?,?,?)",
                 (ev.get("title", ""), ev.get("description", ""), s["sentiment"], s["emotional_weight"], s["scorer_version"], ev.get("ts", now)),
             )
+            event_id = cur.lastrowid
+            for ent_id in resolved_entity_ids:
+                con.execute(
+                    "INSERT OR IGNORE INTO event_entities (event_id, entity_id) VALUES (?, ?)",
+                    (event_id, ent_id),
+                )
+                report["event_entities_written"] += 1
             con.execute(
                 "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('event',?,?,?)",
-                (cur.lastrowid, obs_id, now),
+                (event_id, obs_id, now),
             )
             con.execute(f"RELEASE SAVEPOINT {sp}")
             report["events_written"] += 1
