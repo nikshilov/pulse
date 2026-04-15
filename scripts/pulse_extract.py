@@ -231,15 +231,18 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
         try:
             scored = scorer.score_fact(fact)
             cur = con.execute(
-                "INSERT INTO facts (entity_id, text, confidence, scorer_version, created_at) VALUES (?,?,?,?,?)",
+                """INSERT INTO facts (entity_id, text, confidence, scorer_version, created_at)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(entity_id, text) DO NOTHING""",
                 (entity_id, fact.get("text", ""), scored["confidence"], scored["scorer_version"], now),
             )
-            con.execute(
-                "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('fact',?,?,?)",
-                (cur.lastrowid, obs_id, now),
-            )
+            if cur.rowcount == 1:
+                con.execute(
+                    "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('fact',?,?,?)",
+                    (cur.lastrowid, obs_id, now),
+                )
+                report["facts_written"] += 1
             con.execute(f"RELEASE SAVEPOINT {sp}")
-            report["facts_written"] += 1
         except sqlite3.Error as ex:
             con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
             con.execute(f"RELEASE SAVEPOINT {sp}")
