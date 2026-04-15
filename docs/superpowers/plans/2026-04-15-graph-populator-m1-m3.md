@@ -3122,18 +3122,26 @@ git commit -m "test(e2e): extraction over claude_jsonl fixture — entities+even
 
 - [ ] **Step 1: Build Pulse and start it**
 
+`cmd/pulse` takes `--data-dir` (default `$HOME/.pulse`) and `--addr` (default `127.0.0.1:3800`). There is no `serve` subcommand. `ANTHROPIC_API_KEY` is required by `config.Load`.
+
 ```bash
 cd /Users/nikshilov/dev/ai/pulse
 go build -o bin/pulse ./cmd/pulse
-./bin/pulse serve --db ./pulse-dev.db --addr 127.0.0.1:18889 &
+mkdir -p ./pulse-dev
+export ANTHROPIC_API_KEY=...   # required
+./bin/pulse --data-dir ./pulse-dev --addr 127.0.0.1:18889 &
 echo $! > /tmp/pulse.pid
 ```
 
+DB path: `./pulse-dev/pulse.db`. IPC secret: `./pulse-dev/secret.key`.
+
 - [ ] **Step 2: Dry-run on a single project**
 
-Run (adjust path):
+`pulse_ingest.py` sends `X-Pulse-Key`, read from the `PULSE_KEY` env var. Export it from the generated secret before running.
+
 ```bash
 cd /Users/nikshilov/dev/ai/pulse
+export PULSE_KEY=$(cat ./pulse-dev/secret.key)
 python scripts/pulse_ingest.py --source=claude-jsonl \
   --path=~/.claude/projects/-Users-nikshilov-OpenClawWorkspace \
   --pulse-url=http://127.0.0.1:18889 \
@@ -3154,8 +3162,8 @@ python scripts/pulse_ingest.py --source=claude-jsonl \
 
 Expected: `DONE: inserted=N duplicates=0 revisions=0`. Spot-check via sqlite:
 ```bash
-sqlite3 pulse-dev.db 'SELECT source_kind, COUNT(*) FROM observations GROUP BY source_kind'
-sqlite3 pulse-dev.db 'SELECT COUNT(*) FROM extraction_jobs WHERE state="pending"'
+sqlite3 ./pulse-dev/pulse.db 'SELECT source_kind, COUNT(*) FROM observations GROUP BY source_kind'
+sqlite3 ./pulse-dev/pulse.db 'SELECT COUNT(*) FROM extraction_jobs WHERE state="pending"'
 ```
 
 - [ ] **Step 4: Re-run → verify idempotency**
@@ -3168,7 +3176,7 @@ Run same ingest command. Expected: `inserted=0 duplicates=N`.
 kill $(cat /tmp/pulse.pid) 2>/dev/null
 ```
 
-(Don't commit artifacts — `pulse-dev.db` is gitignored.)
+(Don't commit artifacts — `*.db` and `*.key` are gitignored; `./pulse-dev/` contains only those.)
 
 This task is verification, not code. If anything fails, open a new task to fix.
 
