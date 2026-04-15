@@ -419,3 +419,74 @@ def test_event_with_all_unresolved_entities_fails(tmp_path):
                 if f["item_kind"] == "event" and f["reason"] == "all_entities_involved_unresolved"]
     assert len(failures) == 1
     assert failures[0]["detail"]["title"] == "ghost_event"
+
+
+# ---------- Layer 3: checkpoint ----------
+
+def test_save_artifact_commits_in_own_transaction(tmp_path):
+    """_save_artifact must commit even if no outer tx is active, and be visible immediately."""
+    db = tmp_path / "p1.db"
+    _apply_migrations(db)
+
+    con = pulse_extract._open_connection(str(db))
+    con.execute(
+        "INSERT INTO extraction_jobs(observation_ids,state,created_at,updated_at) VALUES ('[1]','pending','2026-04-16T00:00:00Z','2026-04-16T00:00:00Z')"
+    )
+    pulse_extract._save_artifact(con, job_id=1, kind="triage", obs_id=None,
+                                 payload={"verdicts": [{"verdict": "skip"}]}, model="sonnet-4.6")
+
+    # Probe with a separate connection — artifact must be visible (committed, not just staged).
+    probe = sqlite3.connect(db)
+    row = probe.execute(
+        "SELECT kind, obs_id, payload_json, model FROM extraction_artifacts WHERE job_id=1"
+    ).fetchone()
+    probe.close()
+    con.close()
+    assert row is not None
+    assert row[0] == "triage"
+    assert row[1] is None
+    assert json.loads(row[2]) == {"verdicts": [{"verdict": "skip"}]}
+    assert row[3] == "sonnet-4.6"
+
+
+def test_get_artifact_returns_parsed_payload(tmp_path):
+    db = tmp_path / "p1.db"
+    _apply_migrations(db)
+
+    con = pulse_extract._open_connection(str(db))
+    con.execute(
+        "INSERT INTO extraction_jobs(observation_ids,state,created_at,updated_at) VALUES ('[1]','pending','2026-04-16T00:00:00Z','2026-04-16T00:00:00Z')"
+    )
+    con.execute(
+        """INSERT INTO observations(source_kind,source_id,content_hash,version,scope,captured_at,observed_at,actors,content_text,metadata,raw_json)
+           VALUES ('claude_jsonl','f:1','h',1,'shared','2026-04-16T00:00:00Z','2026-04-16T00:00:00Z','[]','t','{}','{}')"""
+    )
+    pulse_extract._save_artifact(con, 1, "triage", None, {"v": 1}, "sonnet-4.6")
+    pulse_extract._save_artifact(con, 1, "extract", 1, {"entities": [{"canonical_name": "Anna"}]}, "opus-4.6")
+
+    assert pulse_extract._get_artifact(con, 1, "triage", None) == {"v": 1}
+    assert pulse_extract._get_artifact(con, 1, "extract", 1) == {"entities": [{"canonical_name": "Anna"}]}
+    assert pulse_extract._get_artifact(con, 1, "extract", 999) is None
+    assert pulse_extract._get_artifact(con, 1, "triage", 1) is None
+    con.close()
+
+
+def test_save_artifact_is_idempotent_under_partial_unique(tmp_path):
+    """A second _save_artifact for the same (job,kind,obs) must not raise — treated as no-op replay."""
+    db = tmp_path / "p1.db"
+    _apply_migrations(db)
+
+    con = pulse_extract._open_connection(str(db))
+    con.execute(
+        "INSERT INTO extraction_jobs(observation_ids,state,created_at,updated_at) VALUES ('[1]','pending','2026-04-16T00:00:00Z','2026-04-16T00:00:00Z')"
+    )
+    pulse_extract._save_artifact(con, 1, "triage", None, {"v": 1}, "sonnet-4.6")
+    pulse_extract._save_artifact(con, 1, "triage", None, {"v": 2}, "sonnet-4.6")
+
+    rows = con.execute("SELECT COUNT(*) FROM extraction_artifacts WHERE job_id=1 AND kind='triage'").fetchone()[0]
+    payload = json.loads(
+        con.execute("SELECT payload_json FROM extraction_artifacts WHERE job_id=1 AND kind='triage'").fetchone()[0]
+    )
+    con.close()
+    assert rows == 1, "partial UNIQUE + INSERT OR IGNORE keeps exactly one row"
+    assert payload == {"v": 1}, "first save wins; re-save is a no-op (retry-safe, no surprise overwrite)"
