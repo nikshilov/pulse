@@ -304,6 +304,10 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
                 verdicts = call_sonnet_triage(triage_prompt, expected_count=len(observations))
                 job_reports: list[dict] = []
 
+                if len(verdicts) != len(observations):
+                    raise ValueError(
+                        f"triage returned {len(verdicts)} verdicts for {len(observations)} observations"
+                    )
                 for obs, v in zip(observations, verdicts):
                     if v["verdict"] != "extract":
                         continue
@@ -332,7 +336,7 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
 
                 _set_job_state(
                     con, job_id, "done",
-                    triage_model="sonnet-4.6", extract_model="opus-4.6",
+                    triage_model=TRIAGE_MODEL, extract_model=EXTRACT_MODEL,
                 )
                 print(f"job {job_id}: done, apply_report={json.dumps(job_reports, ensure_ascii=False)[:500]}")
             except Exception as e:
@@ -342,6 +346,7 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
                 attempts = attempts_row[0] if attempts_row else 0
                 next_state = "dlq" if attempts >= 3 else "pending"
                 _set_job_state(con, job_id, next_state, last_error=str(e))
+                print(f"job {job_id}: {next_state}, reason={type(e).__name__}: {str(e)[:200]}")
     finally:
         con.close()
     return 0
