@@ -10,6 +10,45 @@ import (
 	"github.com/nkkmnk/pulse/internal/capture"
 )
 
+// applySensitivePolicy checks whether any actor in obs matches a sensitive_actors
+// record and mutates obs.ContentText / obs.MediaRefs / obs.Metadata according to
+// the policy. obs.Redacted is set to true when any policy fires.
+func applySensitivePolicy(ctx context.Context, db *sql.DB, obs *capture.Observation) error {
+	if len(obs.Actors) == 0 {
+		return nil
+	}
+	for _, a := range obs.Actors {
+		var policy string
+		err := db.QueryRowContext(ctx, `
+			SELECT sa.policy
+			FROM sensitive_actors sa
+			JOIN entity_identities ei ON ei.entity_id = sa.entity_id
+			WHERE ei.source_kind = ? AND ei.identifier = ?`,
+			obs.SourceKind, a.ID,
+		).Scan(&policy)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+
+		switch policy {
+		case "no_capture":
+			obs.ContentText = ""
+			obs.MediaRefs = nil
+			obs.Metadata = map[string]any{"sensitive": "no_capture"}
+		case "redact_content":
+			obs.ContentText = "[redacted]"
+		case "summary_only":
+			obs.ContentText = "[summary_only]"
+		}
+		obs.Redacted = true
+		return nil
+	}
+	return nil
+}
+
 // upsert decides whether an observation is a new insert, duplicate, or revision.
 // SELECT-then-INSERT has a race: two concurrent ingests of the same
 // (source_kind, source_id) can both miss and both attempt INSERT. The UNIQUE
@@ -28,6 +67,9 @@ func (h *Handler) upsert(ctx context.Context, obs *capture.Observation) (op, int
 	).Scan(&existingID, &existingHash, &existingVersion)
 
 	if err == sql.ErrNoRows {
+		if err := applySensitivePolicy(ctx, db, obs); err != nil {
+			return 0, 0, fmt.Errorf("sensitive policy: %w", err)
+		}
 		id, err := insertObservation(ctx, db, obs)
 		if err != nil {
 			return 0, 0, err
@@ -48,6 +90,9 @@ func (h *Handler) upsert(ctx context.Context, obs *capture.Observation) (op, int
 	newVersion := existingVersion + 1
 	newObs := *obs
 	newObs.Version = newVersion
+	if err := applySensitivePolicy(ctx, db, &newObs); err != nil {
+		return 0, 0, fmt.Errorf("sensitive policy: %w", err)
+	}
 	newID, err := insertObservation(ctx, db, &newObs)
 	if err != nil {
 		return 0, 0, err
@@ -95,14 +140,19 @@ func insertObservation(ctx context.Context, db *sql.DB, obs *capture.Observation
 	if err != nil {
 		return 0, fmt.Errorf("marshal media_refs: %w", err)
 	}
+	redactedInt := 0
+	if obs.Redacted {
+		redactedInt = 1
+	}
 	res, err := db.ExecContext(ctx, `
 		INSERT INTO observations
 		  (source_kind, source_id, content_hash, version, scope,
-		   captured_at, observed_at, actors, content_text, media_refs, metadata, raw_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		   captured_at, observed_at, actors, content_text, media_refs, metadata, raw_json, redacted)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		obs.SourceKind, obs.SourceID, obs.ContentHash, obs.Version, obs.Scope,
 		obs.CapturedAt.Format(time.RFC3339), obs.ObservedAt.Format(time.RFC3339),
 		string(actors), obs.ContentText, string(media), string(meta), string(obs.RawJSON),
+		redactedInt,
 	)
 	if err != nil {
 		return 0, err

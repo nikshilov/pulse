@@ -31,4 +31,5 @@ type Observation struct {
 	MediaRefs   []MediaRef      `json:"media_refs,omitempty"`
 	Metadata    map[string]any  `json:"metadata,omitempty"`
 	RawJSON     json.RawMessage `json:"raw_json,omitempty"`
+	Redacted    bool            `json:"-"`
 }
