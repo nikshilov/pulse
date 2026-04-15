@@ -189,3 +189,113 @@ def test_savepoint_isolates_one_bad_relation(tmp_path):
     rel_kinds = [r[0] for r in con.execute("SELECT kind FROM relations ORDER BY id")]
     con.close()
     assert rel_kinds == ["friend", "friend"]
+
+
+def test_crash_in_obs_two_preserves_obs_one_writes(tmp_path, monkeypatch):
+    """A RuntimeError in the middle of obs 2's apply must not roll back obs 1's writes."""
+    db = tmp_path / "p0.db"
+    _apply_migrations(db)
+
+    con = sqlite3.connect(db)
+    con.execute(
+        """INSERT INTO observations
+           (source_kind, source_id, content_hash, version, scope, captured_at,
+            observed_at, actors, content_text, metadata, raw_json)
+           VALUES ('claude_jsonl','f:1','h1',1,'shared','2026-04-15T00:00:00Z',
+                   '2026-04-15T00:00:00Z','[]','Anna said hi','{}','{}')"""
+    )
+    con.execute(
+        """INSERT INTO observations
+           (source_kind, source_id, content_hash, version, scope, captured_at,
+            observed_at, actors, content_text, metadata, raw_json)
+           VALUES ('claude_jsonl','f:2','h2',1,'shared','2026-04-15T00:00:00Z',
+                   '2026-04-15T00:00:00Z','[]','Fedya ran','{}','{}')"""
+    )
+    con.execute(
+        """INSERT INTO extraction_jobs
+           (observation_ids, state, attempts, created_at, updated_at)
+           VALUES ('[1,2]', 'pending', 0,
+                   '2026-04-15T00:00:00Z', '2026-04-15T00:00:00Z')"""
+    )
+    con.commit()
+    con.close()
+
+    # Triage: both obs return "extract"
+    def fake_triage(_prompt, expected_count):
+        return [{"verdict": "extract"} for _ in range(expected_count)]
+
+    # Extract for obs 1 writes Anna; extract for obs 2 raises RuntimeError
+    call_count = {"n": 0}
+
+    def fake_extract(_prompt):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return {
+                "entities": [{"canonical_name": "Anna", "kind": "person"}],
+                "events": [], "relations": [], "facts": [],
+            }
+        raise RuntimeError("simulated Anthropic timeout")
+
+    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", fake_triage)
+    monkeypatch.setattr(pulse_extract, "call_opus_extract", fake_extract)
+
+    rc = pulse_extract.run_once(str(db))
+    assert rc == 0
+
+    con = sqlite3.connect(db)
+    names = {r[0] for r in con.execute("SELECT canonical_name FROM entities")}
+    assert names == {"Anna"}, "obs 1's Anna must survive obs 2's crash"
+    anna_count = con.execute("SELECT COUNT(*) FROM entities WHERE canonical_name='Anna'").fetchone()[0]
+    assert anna_count == 1, "Anna must appear exactly once (no duplicate from at-least-once re-apply)"
+
+    job_state = con.execute("SELECT state, last_error FROM extraction_jobs WHERE id=1").fetchone()
+    con.close()
+    assert job_state[0] in ("pending", "dlq"), "job must retry or DLQ, not 'done'"
+    assert job_state[1] is not None and "simulated" in job_state[1]
+
+
+def test_job_state_running_commits_before_apply(tmp_path, monkeypatch):
+    """The state transition to 'running' must commit before any apply writes,
+    so a crash mid-apply can't rewind the state update."""
+    db = tmp_path / "p0.db"
+    _apply_migrations(db)
+
+    con = sqlite3.connect(db)
+    con.execute(
+        """INSERT INTO observations
+           (source_kind, source_id, content_hash, version, scope, captured_at,
+            observed_at, actors, content_text, metadata, raw_json)
+           VALUES ('claude_jsonl','f:1','h1',1,'shared','2026-04-15T00:00:00Z',
+                   '2026-04-15T00:00:00Z','[]','hi','{}','{}')"""
+    )
+    con.execute(
+        """INSERT INTO extraction_jobs
+           (observation_ids, state, attempts, created_at, updated_at)
+           VALUES ('[1]', 'pending', 0,
+                   '2026-04-15T00:00:00Z', '2026-04-15T00:00:00Z')"""
+    )
+    con.commit()
+    con.close()
+
+    def fake_triage(_prompt, expected_count):
+        return [{"verdict": "extract"}]
+
+    # Capture job state at the moment extract is called
+    captured = {}
+
+    def fake_extract(_prompt):
+        probe = sqlite3.connect(db)
+        probe.execute("PRAGMA busy_timeout=2000")
+        row = probe.execute("SELECT state, attempts FROM extraction_jobs WHERE id=1").fetchone()
+        probe.close()
+        captured["state_mid"] = row[0]
+        captured["attempts_mid"] = row[1]
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", fake_triage)
+    monkeypatch.setattr(pulse_extract, "call_opus_extract", fake_extract)
+
+    pulse_extract.run_once(str(db))
+
+    assert captured["state_mid"] == "running", "state must be 'running' during apply"
+    assert captured["attempts_mid"] == 1, "attempts must be incremented before apply"

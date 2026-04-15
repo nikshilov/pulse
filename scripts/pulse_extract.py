@@ -244,57 +244,106 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
     return report
 
 
+def _set_job_state(con: sqlite3.Connection, job_id: int, state: str, *,
+                   last_error: str | None = None, increment_attempts: bool = False,
+                   triage_model: str | None = None, extract_model: str | None = None) -> None:
+    """Update extraction_jobs state in its own committed tx.
+
+    Called at two boundaries: claim (pending -> running, +1 attempt) and
+    finalize (running -> done/failed/dlq). Keeps state transitions durable
+    regardless of apply-stage success.
+    """
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    sets = ["state=?", "updated_at=?"]
+    args: list = [state, now]
+    if increment_attempts:
+        sets.append("attempts=attempts+1")
+    if last_error is not None:
+        sets.append("last_error=?")
+        args.append(last_error[:500])
+    if triage_model is not None:
+        sets.append("triage_model=?")
+        args.append(triage_model)
+    if extract_model is not None:
+        sets.append("extract_model=?")
+        args.append(extract_model)
+    args.append(job_id)
+
+    con.execute("BEGIN IMMEDIATE")
+    con.execute(f"UPDATE extraction_jobs SET {', '.join(sets)} WHERE id=?", args)
+    con.execute("COMMIT")
+
+
 def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
-    con = sqlite3.connect(db_path)
-    con.execute("PRAGMA foreign_keys=ON")
+    con = _open_connection(db_path)
 
-    if budget_usd_remaining <= 0:
-        print("budget exhausted for today — skipping extraction run")
+    try:
+        if budget_usd_remaining <= 0:
+            print("budget exhausted for today — skipping extraction run")
+            return 0
+
+        jobs = con.execute(
+            "SELECT id, observation_ids FROM extraction_jobs "
+            "WHERE state='pending' ORDER BY created_at LIMIT 10"
+        ).fetchall()
+        if not jobs:
+            print("no pending jobs")
+            return 0
+
+        for job_id, obs_ids_json in jobs:
+            obs_ids = json.loads(obs_ids_json)
+            _set_job_state(con, job_id, "running", increment_attempts=True)
+
+            observations = _load_observations(con, obs_ids)
+            if not observations:
+                _set_job_state(con, job_id, "failed", last_error="no observations")
+                continue
+
+            try:
+                triage_prompt = prompts.build_triage_prompt(observations)
+                verdicts = call_sonnet_triage(triage_prompt, expected_count=len(observations))
+                job_reports: list[dict] = []
+
+                for obs, v in zip(observations, verdicts):
+                    if v["verdict"] != "extract":
+                        continue
+                    graph_ctx = {"existing_entities": _load_existing_entities(con)}
+                    extract_prompt = prompts.build_extract_prompt(obs, graph_ctx)
+                    result = call_opus_extract(extract_prompt)
+
+                    con.execute("BEGIN IMMEDIATE")
+                    try:
+                        obs_report = _apply_extraction(con, obs["id"], result)
+                        con.execute("COMMIT")
+                        job_reports.append(obs_report)
+                    except Exception as ex:
+                        con.execute("ROLLBACK")
+                        job_reports.append({
+                            "obs_id": obs["id"],
+                            "entities_written": 0, "events_written": 0,
+                            "relations_written": 0, "facts_written": 0,
+                            "failed_items": [{
+                                "item_kind": "whole_obs",
+                                "reason": f"{type(ex).__name__}: {str(ex)[:200]}",
+                                "detail": {},
+                            }],
+                        })
+                        raise
+
+                _set_job_state(
+                    con, job_id, "done",
+                    triage_model="sonnet-4.6", extract_model="opus-4.6",
+                )
+                print(f"job {job_id}: done, apply_report={json.dumps(job_reports, ensure_ascii=False)[:500]}")
+            except Exception as e:
+                attempts_row = con.execute(
+                    "SELECT attempts FROM extraction_jobs WHERE id=?", (job_id,)
+                ).fetchone()
+                attempts = attempts_row[0] if attempts_row else 0
+                next_state = "dlq" if attempts >= 3 else "pending"
+                _set_job_state(con, job_id, next_state, last_error=str(e))
+    finally:
         con.close()
-        return 0
-
-    jobs = con.execute("SELECT id, observation_ids FROM extraction_jobs WHERE state='pending' ORDER BY created_at LIMIT 10").fetchall()
-    if not jobs:
-        print("no pending jobs")
-        return 0
-
-    for job_id, obs_ids_json in jobs:
-        obs_ids = json.loads(obs_ids_json)
-        con.execute("UPDATE extraction_jobs SET state='running', attempts=attempts+1, updated_at=? WHERE id=?",
-                    (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), job_id))
-        con.commit()
-
-        observations = _load_observations(con, obs_ids)
-        if not observations:
-            con.execute("UPDATE extraction_jobs SET state='failed', last_error='no observations', updated_at=? WHERE id=?",
-                        (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), job_id))
-            con.commit()
-            continue
-
-        try:
-            triage_prompt = prompts.build_triage_prompt(observations)
-            verdicts = call_sonnet_triage(triage_prompt, expected_count=len(observations))
-
-            for obs, v in zip(observations, verdicts):
-                if v["verdict"] != "extract":
-                    continue
-                graph_ctx = {"existing_entities": _load_existing_entities(con)}
-                extract_prompt = prompts.build_extract_prompt(obs, graph_ctx)
-                result = call_opus_extract(extract_prompt)
-                _apply_extraction(con, obs["id"], result)
-
-            con.execute("UPDATE extraction_jobs SET state='done', triage_model='sonnet-4.6', extract_model='opus-4.6', updated_at=? WHERE id=?",
-                        (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), job_id))
-            con.commit()
-        except Exception as e:
-            attempts_row = con.execute("SELECT attempts FROM extraction_jobs WHERE id=?", (job_id,)).fetchone()
-            attempts = attempts_row[0] if attempts_row else 0
-            next_state = "dlq" if attempts >= 3 else "pending"  # pending → retry on next run
-            con.execute("UPDATE extraction_jobs SET state=?, last_error=?, updated_at=? WHERE id=?",
-                        (next_state, str(e)[:500], time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), job_id))
-            con.commit()
-
-    con.close()
     return 0
 
 
