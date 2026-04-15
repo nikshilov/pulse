@@ -97,13 +97,9 @@ def _load_existing_entities(con: sqlite3.Connection) -> list[dict]:
 def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dict:
     """Apply one extraction result to the graph. Caller owns the outer transaction.
 
-    Returns an apply_report dict:
-        {
-          "obs_id": int,
-          "entities_written": int, "events_written": int,
-          "relations_written": int, "facts_written": int,
-          "failed_items": [ {"item_kind": str, "reason": str, "detail": dict}, ... ]
-        }
+    Each item (entity/event/relation/fact) is wrapped in SAVEPOINT so an
+    sqlite3.IntegrityError on one item does not abort the others. The caller's
+    outer tx stays open on return.
     """
     report = {
         "obs_id": obs_id,
@@ -116,112 +112,134 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
 
     existing = _load_existing_entities(con)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
     name_to_id: dict[str, int] = {}
 
+    def _item_failure(item_kind: str, reason: str, detail: dict) -> None:
+        report["failed_items"].append({"item_kind": item_kind, "reason": reason, "detail": detail})
+
     # --- entities ---
-    for ent in result.get("entities", []):
-        dec = resolver.resolve_entity(ent, existing)
-        scored = scorer.score_entity(ent)
-        if dec.action == "bind_identity":
+    for idx, ent in enumerate(result.get("entities", [])):
+        sp = f"ent_{idx}"
+        con.execute(f"SAVEPOINT {sp}")
+        try:
+            dec = resolver.resolve_entity(ent, existing)
+            scored = scorer.score_entity(ent)
+            if dec.action == "bind_identity":
+                con.execute(
+                    "UPDATE entities SET last_seen=?, salience_score=?, emotional_weight=?, scorer_version=? WHERE id=?",
+                    (now, scored["salience_score"], scored["emotional_weight"], scored["scorer_version"], dec.entity_id),
+                )
+                entity_id = dec.entity_id
+            else:
+                cur = con.execute(
+                    "INSERT INTO entities (canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight, scorer_version) VALUES (?,?,?,?,?,?,?,?)",
+                    (ent["canonical_name"], ent.get("kind", "person"), json.dumps(ent.get("aliases") or []),
+                     now, now, scored["salience_score"], scored["emotional_weight"], scored["scorer_version"]),
+                )
+                entity_id = cur.lastrowid
+                existing.append({"id": entity_id, "canonical_name": ent["canonical_name"], "kind": ent.get("kind", "person"), "aliases": ent.get("aliases") or []})
+
+                if dec.action == "proposal" and dec.entity_id:
+                    con.execute(
+                        "INSERT INTO entity_merge_proposals (from_entity_id, to_entity_id, confidence, evidence_md, state, proposed_at) VALUES (?,?,?,?,?,?)",
+                        (entity_id, dec.entity_id, dec.confidence, dec.reason, "pending", now),
+                    )
+                elif dec.action == "new_entity_with_question":
+                    ttl = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 7 * 86400))
+                    con.execute(
+                        "INSERT INTO open_questions (subject_entity_id, question_text, asked_at, ttl_expires_at, state) VALUES (?,?,?,?,?)",
+                        (entity_id, f"Is {ent['canonical_name']} a new person, or an alias of someone I know?", now, ttl, "open"),
+                    )
+
             con.execute(
-                "UPDATE entities SET last_seen=?, salience_score=?, emotional_weight=?, scorer_version=? WHERE id=?",
-                (now, scored["salience_score"], scored["emotional_weight"], scored["scorer_version"], dec.entity_id),
+                "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('entity',?,?,?)",
+                (entity_id, obs_id, now),
             )
-            entity_id = dec.entity_id
-        else:
-            cur = con.execute(
-                "INSERT INTO entities (canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight, scorer_version) VALUES (?,?,?,?,?,?,?,?)",
-                (ent["canonical_name"], ent.get("kind", "person"), json.dumps(ent.get("aliases") or []),
-                 now, now, scored["salience_score"], scored["emotional_weight"], scored["scorer_version"]),
-            )
-            entity_id = cur.lastrowid
-            existing.append({"id": entity_id, "canonical_name": ent["canonical_name"], "kind": ent.get("kind", "person"), "aliases": ent.get("aliases") or []})
+            con.execute(f"RELEASE SAVEPOINT {sp}")
 
-            if dec.action == "proposal" and dec.entity_id:
-                con.execute(
-                    "INSERT INTO entity_merge_proposals (from_entity_id, to_entity_id, confidence, evidence_md, state, proposed_at) VALUES (?,?,?,?,?,?)",
-                    (entity_id, dec.entity_id, dec.confidence, dec.reason, "pending", now),
-                )
-            elif dec.action == "new_entity_with_question":
-                ttl = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 7 * 86400))
-                con.execute(
-                    "INSERT INTO open_questions (subject_entity_id, question_text, asked_at, ttl_expires_at, state) VALUES (?,?,?,?,?)",
-                    (entity_id, f"Is {ent['canonical_name']} a new person, or an alias of someone I know?", now, ttl, "open"),
-                )
-
-        con.execute(
-            "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('entity',?,?,?)",
-            (entity_id, obs_id, now),
-        )
-
-        name_to_id[ent["canonical_name"]] = entity_id
-        for alias in (ent.get("aliases") or []):
-            name_to_id[alias] = entity_id
-        report["entities_written"] += 1
+            name_to_id[ent["canonical_name"]] = entity_id
+            for alias in (ent.get("aliases") or []):
+                name_to_id[alias] = entity_id
+            report["entities_written"] += 1
+        except sqlite3.Error as ex:
+            con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+            con.execute(f"RELEASE SAVEPOINT {sp}")
+            _item_failure("entity", str(ex)[:200], {"canonical_name": ent.get("canonical_name", ""), "kind": ent.get("kind", "")})
 
     # --- events ---
-    for ev in result.get("events", []):
+    for idx, ev in enumerate(result.get("events", [])):
         involved = ev.get("entities_involved") or []
         if not involved:
-            report["failed_items"].append({
-                "item_kind": "event",
-                "reason": "orphan_event_no_entities_involved",
-                "detail": {"title": ev.get("title", "")},
-            })
+            _item_failure("event", "orphan_event_no_entities_involved", {"title": ev.get("title", "")})
             continue
-        s = scorer.score_event(ev)
-        cur = con.execute(
-            "INSERT INTO events (title, description, sentiment, emotional_weight, scorer_version, ts) VALUES (?,?,?,?,?,?)",
-            (ev.get("title", ""), ev.get("description", ""), s["sentiment"], s["emotional_weight"], s["scorer_version"], ev.get("ts", now)),
-        )
-        con.execute(
-            "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('event',?,?,?)",
-            (cur.lastrowid, obs_id, now),
-        )
-        report["events_written"] += 1
+        sp = f"ev_{idx}"
+        con.execute(f"SAVEPOINT {sp}")
+        try:
+            s = scorer.score_event(ev)
+            cur = con.execute(
+                "INSERT INTO events (title, description, sentiment, emotional_weight, scorer_version, ts) VALUES (?,?,?,?,?,?)",
+                (ev.get("title", ""), ev.get("description", ""), s["sentiment"], s["emotional_weight"], s["scorer_version"], ev.get("ts", now)),
+            )
+            con.execute(
+                "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('event',?,?,?)",
+                (cur.lastrowid, obs_id, now),
+            )
+            con.execute(f"RELEASE SAVEPOINT {sp}")
+            report["events_written"] += 1
+        except sqlite3.Error as ex:
+            con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+            con.execute(f"RELEASE SAVEPOINT {sp}")
+            _item_failure("event", str(ex)[:200], {"title": ev.get("title", "")})
 
     # --- relations ---
-    for rel in result.get("relations", []):
+    for idx, rel in enumerate(result.get("relations", [])):
         from_id = name_to_id.get(rel.get("from", ""))
         to_id = name_to_id.get(rel.get("to", ""))
         if from_id is None or to_id is None:
-            report["failed_items"].append({
-                "item_kind": "relation",
-                "reason": "unknown_entity",
-                "detail": {"from": rel.get("from", ""), "to": rel.get("to", "")},
-            })
+            _item_failure("relation", "unknown_entity", {"from": rel.get("from", ""), "to": rel.get("to", "")})
             continue
-        cur = con.execute(
-            "INSERT INTO relations (from_entity_id, to_entity_id, kind, strength, first_seen, last_seen) VALUES (?,?,?,?,?,?)",
-            (from_id, to_id, rel.get("kind", ""), float(rel.get("strength", 0.0)), now, now),
-        )
-        con.execute(
-            "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('relation',?,?,?)",
-            (cur.lastrowid, obs_id, now),
-        )
-        report["relations_written"] += 1
+        sp = f"rel_{idx}"
+        con.execute(f"SAVEPOINT {sp}")
+        try:
+            cur = con.execute(
+                "INSERT INTO relations (from_entity_id, to_entity_id, kind, strength, first_seen, last_seen) VALUES (?,?,?,?,?,?)",
+                (from_id, to_id, rel.get("kind", ""), float(rel.get("strength", 0.0)), now, now),
+            )
+            con.execute(
+                "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('relation',?,?,?)",
+                (cur.lastrowid, obs_id, now),
+            )
+            con.execute(f"RELEASE SAVEPOINT {sp}")
+            report["relations_written"] += 1
+        except sqlite3.Error as ex:
+            con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+            con.execute(f"RELEASE SAVEPOINT {sp}")
+            _item_failure("relation", str(ex)[:200], {"from": rel.get("from", ""), "to": rel.get("to", ""), "kind": rel.get("kind", "")})
 
     # --- facts ---
-    for fact in result.get("facts", []):
+    for idx, fact in enumerate(result.get("facts", [])):
         entity_id = name_to_id.get(fact.get("entity", ""))
         if entity_id is None:
-            report["failed_items"].append({
-                "item_kind": "fact",
-                "reason": "unknown_entity",
-                "detail": {"entity": fact.get("entity", ""), "text": fact.get("text", "")[:80]},
-            })
+            _item_failure("fact", "unknown_entity", {"entity": fact.get("entity", ""), "text": fact.get("text", "")[:80]})
             continue
-        scored = scorer.score_fact(fact)
-        cur = con.execute(
-            "INSERT INTO facts (entity_id, text, confidence, scorer_version, created_at) VALUES (?,?,?,?,?)",
-            (entity_id, fact.get("text", ""), scored["confidence"], scored["scorer_version"], now),
-        )
-        con.execute(
-            "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('fact',?,?,?)",
-            (cur.lastrowid, obs_id, now),
-        )
-        report["facts_written"] += 1
+        sp = f"fact_{idx}"
+        con.execute(f"SAVEPOINT {sp}")
+        try:
+            scored = scorer.score_fact(fact)
+            cur = con.execute(
+                "INSERT INTO facts (entity_id, text, confidence, scorer_version, created_at) VALUES (?,?,?,?,?)",
+                (entity_id, fact.get("text", ""), scored["confidence"], scored["scorer_version"], now),
+            )
+            con.execute(
+                "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('fact',?,?,?)",
+                (cur.lastrowid, obs_id, now),
+            )
+            con.execute(f"RELEASE SAVEPOINT {sp}")
+            report["facts_written"] += 1
+        except sqlite3.Error as ex:
+            con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+            con.execute(f"RELEASE SAVEPOINT {sp}")
+            _item_failure("fact", str(ex)[:200], {"entity": fact.get("entity", ""), "text": fact.get("text", "")[:80]})
 
     return report
 
