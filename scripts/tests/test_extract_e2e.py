@@ -83,5 +83,6 @@ def test_e2e_prints_apply_report(tmp_path, monkeypatch, capsys):
 
     captured = capsys.readouterr()
     assert "apply_report=" in captured.out
-    # Sanity: the report must mention at least one entity_written
+    # Report shape must carry all Phase 0 + Phase 1 write counters
     assert '"entities_written"' in captured.out
+    assert '"event_entities_written"' in captured.out
