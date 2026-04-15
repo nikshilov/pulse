@@ -5,6 +5,7 @@ Reads pending extraction_jobs, runs Sonnet triage + Opus extract, writes
 entities/relations/events/facts/evidence, advances job state.
 """
 
+import anthropic
 import argparse
 import json
 import os
@@ -16,13 +17,43 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from extract import prompts, resolver, scorer
 
-# These wrap anthropic SDK in real code. For tests they're monkey-patched.
-def call_sonnet_triage(prompt: str) -> list[dict]:
-    raise NotImplementedError("wire up anthropic client before production run")
+_client_cache = None
+
+TRIAGE_MODEL = "claude-sonnet-4-6"
+EXTRACT_MODEL = "claude-opus-4-6"
+
+
+def _anthropic_client():
+    """Lazy, cached Anthropic client. Raises RuntimeError if key missing."""
+    global _client_cache
+    if _client_cache is None:
+        key = os.getenv("ANTHROPIC_API_KEY")
+        if not key:
+            raise RuntimeError("ANTHROPIC_API_KEY env var required for extraction")
+        _client_cache = anthropic.Anthropic(api_key=key)
+    return _client_cache
+
+
+def call_sonnet_triage(prompt: str, expected_count: int) -> list[dict]:
+    client = _anthropic_client()
+    msg = client.messages.create(
+        model=TRIAGE_MODEL,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = "".join(block.text for block in msg.content if hasattr(block, "text"))
+    return prompts.parse_triage_response(text, expected_count)
 
 
 def call_opus_extract(prompt: str) -> dict:
-    raise NotImplementedError("wire up anthropic client before production run")
+    client = _anthropic_client()
+    msg = client.messages.create(
+        model=EXTRACT_MODEL,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = "".join(block.text for block in msg.content if hasattr(block, "text"))
+    return prompts.parse_extract_response(text)
 
 
 def _load_observations(con: sqlite3.Connection, ids: list[int]) -> list[dict]:
@@ -163,7 +194,7 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
 
         try:
             triage_prompt = prompts.build_triage_prompt(observations)
-            verdicts = call_sonnet_triage(triage_prompt)
+            verdicts = call_sonnet_triage(triage_prompt, expected_count=len(observations))
 
             for obs, v in zip(observations, verdicts):
                 if v["verdict"] != "extract":
