@@ -296,6 +296,40 @@ def _set_job_state(con: sqlite3.Connection, job_id: int, state: str, *,
     con.execute("COMMIT")
 
 
+def _get_artifact(con: sqlite3.Connection, job_id: int, kind: str,
+                  obs_id: int | None) -> dict | None:
+    """Return the parsed payload_json for a (job_id, kind, obs_id) artifact, or None."""
+    if obs_id is None:
+        row = con.execute(
+            "SELECT payload_json FROM extraction_artifacts WHERE job_id=? AND kind=? AND obs_id IS NULL",
+            (job_id, kind),
+        ).fetchone()
+    else:
+        row = con.execute(
+            "SELECT payload_json FROM extraction_artifacts WHERE job_id=? AND kind=? AND obs_id=?",
+            (job_id, kind, obs_id),
+        ).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def _save_artifact(con: sqlite3.Connection, job_id: int, kind: str,
+                   obs_id: int | None, payload: dict, model: str) -> None:
+    """Persist a checkpoint artifact in its own committed tx.
+
+    First-write-wins: partial UNIQUE indices + INSERT OR IGNORE keep one
+    row per (job_id,kind,obs_id). Re-saving the same triple is a safe no-op
+    — the caller may be replaying after a crash where the artifact was
+    already committed but the downstream work (apply) hadn't finished.
+    """
+    con.execute("BEGIN IMMEDIATE")
+    con.execute(
+        "INSERT OR IGNORE INTO extraction_artifacts(job_id, kind, obs_id, payload_json, model) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (job_id, kind, obs_id, json.dumps(payload, ensure_ascii=False), model),
+    )
+    con.execute("COMMIT")
+
+
 def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
     con = _open_connection(db_path)
 
