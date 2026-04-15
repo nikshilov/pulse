@@ -108,3 +108,41 @@ def test_event_without_entities_involved_is_dropped(tmp_path):
     db_events = con.execute("SELECT title FROM events").fetchall()
     con.close()
     assert [r[0] for r in db_events] == ["meeting"]
+
+
+def test_savepoint_isolates_one_bad_entity(tmp_path):
+    """If entity 2 of 3 violates a CHECK constraint, entities 1 and 3 must still be written."""
+    db = tmp_path / "p0.db"
+    _apply_migrations(db)
+
+    con = pulse_extract._open_connection(str(db))
+    con.execute(
+        """INSERT INTO observations
+           (source_kind, source_id, content_hash, version, scope, captured_at,
+            observed_at, actors, content_text, metadata, raw_json)
+           VALUES ('claude_jsonl','f:1','h1',1,'shared','2026-04-15T00:00:00Z',
+                   '2026-04-15T00:00:00Z','[]','hello','{}','{}')"""
+    )
+    con.execute("BEGIN IMMEDIATE")
+    result = {
+        "entities": [
+            {"canonical_name": "Anna", "kind": "person"},
+            # kind='potato' violates CHECK (kind IN (...)) — must be skipped, not abort
+            {"canonical_name": "Bad", "kind": "potato"},
+            {"canonical_name": "Fedya", "kind": "person"},
+        ],
+        "events": [],
+        "relations": [],
+        "facts": [],
+    }
+    report = pulse_extract._apply_extraction(con, 1, result)
+    con.execute("COMMIT")
+
+    assert report["entities_written"] == 2, "good entities (Anna, Fedya) must both commit"
+    bad = [f for f in report["failed_items"] if f["item_kind"] == "entity"]
+    assert len(bad) == 1
+    assert bad[0]["detail"]["canonical_name"] == "Bad"
+
+    names = {r[0] for r in con.execute("SELECT canonical_name FROM entities")}
+    con.close()
+    assert names == {"Anna", "Fedya"}
