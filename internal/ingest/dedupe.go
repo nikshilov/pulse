@@ -39,16 +39,22 @@ func (h *Handler) upsert(ctx context.Context, obs *capture.Observation) (op, int
 	}
 
 	// Revision: new version row + revision audit record.
-	obs.Version = existingVersion + 1
-	newID, err := insertObservation(ctx, db, obs)
+	newVersion := existingVersion + 1
+	newObs := *obs
+	newObs.Version = newVersion
+	newID, err := insertObservation(ctx, db, &newObs)
 	if err != nil {
 		return 0, 0, err
+	}
+	diff, err := computeDiff(ctx, db, existingID, obs.ContentText)
+	if err != nil {
+		return 0, 0, fmt.Errorf("compute diff: %w", err)
 	}
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO observation_revisions (observation_id, version, prev_hash, diff, changed_at)
 		VALUES (?, ?, ?, ?, ?)`,
-		newID, obs.Version, existingHash,
-		computeDiff(ctx, db, existingID, obs.ContentText),
+		newID, newVersion, existingHash,
+		diff,
 		time.Now().UTC().Format(time.RFC3339),
 	); err != nil {
 		return 0, 0, fmt.Errorf("record revision: %w", err)
@@ -86,8 +92,10 @@ func insertObservation(ctx context.Context, db *sql.DB, obs *capture.Observation
 
 // computeDiff produces a compact human-readable marker for the revision audit log.
 // We record quoted prefixes of the previous and new content_text — not a real diff.
-func computeDiff(ctx context.Context, db *sql.DB, prevID int64, newContent string) string {
+func computeDiff(ctx context.Context, db *sql.DB, prevID int64, newContent string) (string, error) {
 	var prev string
-	db.QueryRowContext(ctx, `SELECT content_text FROM observations WHERE id=?`, prevID).Scan(&prev)
-	return fmt.Sprintf("-%.100q\n+%.100q", prev, newContent)
+	if err := db.QueryRowContext(ctx, `SELECT content_text FROM observations WHERE id=?`, prevID).Scan(&prev); err != nil {
+		return "", fmt.Errorf("fetch prev content (id=%d): %w", prevID, err)
+	}
+	return fmt.Sprintf("-%.100q\n+%.100q", prev, newContent), nil
 }

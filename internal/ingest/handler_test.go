@@ -13,6 +13,14 @@ import (
 	"github.com/nkkmnk/pulse/internal/store"
 )
 
+func decodeResp(t *testing.T, body []byte) (resp struct{ Inserted, Duplicates, Revisions int }) {
+	t.Helper()
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("unmarshal response: %v\nbody=%s", err, string(body))
+	}
+	return resp
+}
+
 func timeParse(t *testing.T, s string) time.Time {
 	t.Helper()
 	tt, err := time.Parse(time.RFC3339, s)
@@ -54,8 +62,7 @@ func TestIngestInsertsNewObservation(t *testing.T) {
 		t.Fatalf("status: got %d body=%s", rec.Code, rec.Body.String())
 	}
 
-	var resp struct{ Inserted, Duplicates, Revisions int }
-	json.Unmarshal(rec.Body.Bytes(), &resp)
+	resp := decodeResp(t, rec.Body.Bytes())
 	if resp.Inserted != 1 {
 		t.Errorf("inserted: got %d", resp.Inserted)
 	}
@@ -84,8 +91,7 @@ func TestIngestDedupsIdenticalHash(t *testing.T) {
 	rec2 := httptest.NewRecorder()
 	h.ServeHTTP(rec2, req2)
 
-	var resp struct{ Inserted, Duplicates, Revisions int }
-	json.Unmarshal(rec2.Body.Bytes(), &resp)
+	resp := decodeResp(t, rec2.Body.Bytes())
 	if resp.Duplicates != 1 {
 		t.Errorf("duplicates: got %d", resp.Duplicates)
 	}
@@ -118,20 +124,23 @@ func TestIngestRevisionOnHashChange(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewReader(body2)))
 
-	var resp struct{ Inserted, Duplicates, Revisions int }
-	json.Unmarshal(rec.Body.Bytes(), &resp)
+	resp := decodeResp(t, rec.Body.Bytes())
 	if resp.Revisions != 1 {
 		t.Errorf("revisions: got %d", resp.Revisions)
 	}
 
 	// Check DB: version=2 exists, observation_revisions has one row
 	var maxVer int
-	s.DB().QueryRow(`SELECT MAX(version) FROM observations WHERE source_kind='tg' AND source_id='m:1'`).Scan(&maxVer)
+	if err := s.DB().QueryRow(`SELECT MAX(version) FROM observations WHERE source_kind='tg' AND source_id='m:1'`).Scan(&maxVer); err != nil {
+		t.Fatalf("scan max version: %v", err)
+	}
 	if maxVer != 2 {
 		t.Errorf("max version: got %d", maxVer)
 	}
 	var revCount int
-	s.DB().QueryRow(`SELECT COUNT(*) FROM observation_revisions`).Scan(&revCount)
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM observation_revisions`).Scan(&revCount); err != nil {
+		t.Fatalf("scan rev count: %v", err)
+	}
 	if revCount != 1 {
 		t.Errorf("revisions row count: got %d", revCount)
 	}
