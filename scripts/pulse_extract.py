@@ -34,6 +34,22 @@ def _anthropic_client():
     return _client_cache
 
 
+def _open_connection(db_path: str) -> sqlite3.Connection:
+    """Open a sqlite3 connection wired for the extractor.
+
+    - PRAGMA busy_timeout=5000: survive WAL contention with the Go ingest process
+      (the Go side sets the same value via DSN in internal/store/store.go).
+    - PRAGMA foreign_keys=ON: schema assumes FK enforcement.
+    - isolation_level=None: manual BEGIN/COMMIT so we can scope transactions to a
+      single observation and use SAVEPOINT per item.
+    """
+    con = sqlite3.connect(db_path)
+    con.isolation_level = None
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=5000")
+    return con
+
+
 def call_sonnet_triage(prompt: str, expected_count: int) -> list[dict]:
     client = _anthropic_client()
     msg = client.messages.create(
