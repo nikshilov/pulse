@@ -94,20 +94,40 @@ def _load_existing_entities(con: sqlite3.Connection) -> list[dict]:
     ]
 
 
-def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> None:
+def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dict:
+    """Apply one extraction result to the graph. Caller owns the outer transaction.
+
+    Returns an apply_report dict:
+        {
+          "obs_id": int,
+          "entities_written": int, "events_written": int,
+          "relations_written": int, "facts_written": int,
+          "failed_items": [ {"item_kind": str, "reason": str, "detail": dict}, ... ]
+        }
+    """
+    report = {
+        "obs_id": obs_id,
+        "entities_written": 0,
+        "events_written": 0,
+        "relations_written": 0,
+        "facts_written": 0,
+        "failed_items": [],
+    }
+
     existing = _load_existing_entities(con)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    # name_to_id: canonical_name + all aliases → entity_id
     name_to_id: dict[str, int] = {}
 
+    # --- entities ---
     for ent in result.get("entities", []):
         dec = resolver.resolve_entity(ent, existing)
         scored = scorer.score_entity(ent)
         if dec.action == "bind_identity":
-            # update last_seen + scores (we trust new data equally)
-            con.execute("UPDATE entities SET last_seen=?, salience_score=?, emotional_weight=?, scorer_version=? WHERE id=?",
-                        (now, scored["salience_score"], scored["emotional_weight"], scored["scorer_version"], dec.entity_id))
+            con.execute(
+                "UPDATE entities SET last_seen=?, salience_score=?, emotional_weight=?, scorer_version=? WHERE id=?",
+                (now, scored["salience_score"], scored["emotional_weight"], scored["scorer_version"], dec.entity_id),
+            )
             entity_id = dec.entity_id
         else:
             cur = con.execute(
@@ -116,7 +136,7 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> Non
                  now, now, scored["salience_score"], scored["emotional_weight"], scored["scorer_version"]),
             )
             entity_id = cur.lastrowid
-            existing.append({"id": entity_id, "canonical_name": ent["canonical_name"], "kind": ent.get("kind","person"), "aliases": ent.get("aliases") or []})
+            existing.append({"id": entity_id, "canonical_name": ent["canonical_name"], "kind": ent.get("kind", "person"), "aliases": ent.get("aliases") or []})
 
             if dec.action == "proposal" and dec.entity_id:
                 con.execute(
@@ -130,55 +150,80 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> Non
                     (entity_id, f"Is {ent['canonical_name']} a new person, or an alias of someone I know?", now, ttl, "open"),
                 )
 
-        con.execute("INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('entity',?,?,?)",
-                    (entity_id, obs_id, now))
+        con.execute(
+            "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('entity',?,?,?)",
+            (entity_id, obs_id, now),
+        )
 
-        # Register canonical name and all aliases in the lookup map
         name_to_id[ent["canonical_name"]] = entity_id
         for alias in (ent.get("aliases") or []):
             name_to_id[alias] = entity_id
+        report["entities_written"] += 1
 
-    # events
+    # --- events ---
     for ev in result.get("events", []):
-        s = scorer.score_event(ev)
-        cur = con.execute("INSERT INTO events (title, description, sentiment, emotional_weight, scorer_version, ts) VALUES (?,?,?,?,?,?)",
-                          (ev.get("title",""), ev.get("description",""), s["sentiment"], s["emotional_weight"], s["scorer_version"], ev.get("ts", now)))
-        con.execute("INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('event',?,?,?)",
-                    (cur.lastrowid, obs_id, now))
-
-    # relations
-    for rel in result.get("relations", []):
-        from_name = rel.get("from", "")
-        to_name = rel.get("to", "")
-        from_id = name_to_id.get(from_name)
-        to_id = name_to_id.get(to_name)
-        if from_id is None:
-            print(f"skipping relation: unknown entity '{from_name}'")
+        involved = ev.get("entities_involved") or []
+        if not involved:
+            report["failed_items"].append({
+                "item_kind": "event",
+                "reason": "orphan_event_no_entities_involved",
+                "detail": {"title": ev.get("title", "")},
+            })
             continue
-        if to_id is None:
-            print(f"skipping relation: unknown entity '{to_name}'")
+        s = scorer.score_event(ev)
+        cur = con.execute(
+            "INSERT INTO events (title, description, sentiment, emotional_weight, scorer_version, ts) VALUES (?,?,?,?,?,?)",
+            (ev.get("title", ""), ev.get("description", ""), s["sentiment"], s["emotional_weight"], s["scorer_version"], ev.get("ts", now)),
+        )
+        con.execute(
+            "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('event',?,?,?)",
+            (cur.lastrowid, obs_id, now),
+        )
+        report["events_written"] += 1
+
+    # --- relations ---
+    for rel in result.get("relations", []):
+        from_id = name_to_id.get(rel.get("from", ""))
+        to_id = name_to_id.get(rel.get("to", ""))
+        if from_id is None or to_id is None:
+            report["failed_items"].append({
+                "item_kind": "relation",
+                "reason": "unknown_entity",
+                "detail": {"from": rel.get("from", ""), "to": rel.get("to", "")},
+            })
             continue
         cur = con.execute(
             "INSERT INTO relations (from_entity_id, to_entity_id, kind, strength, first_seen, last_seen) VALUES (?,?,?,?,?,?)",
             (from_id, to_id, rel.get("kind", ""), float(rel.get("strength", 0.0)), now, now),
         )
-        con.execute("INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('relation',?,?,?)",
-                    (cur.lastrowid, obs_id, now))
+        con.execute(
+            "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('relation',?,?,?)",
+            (cur.lastrowid, obs_id, now),
+        )
+        report["relations_written"] += 1
 
-    # facts
+    # --- facts ---
     for fact in result.get("facts", []):
-        entity_name = fact.get("entity", "")
-        entity_id = name_to_id.get(entity_name)
+        entity_id = name_to_id.get(fact.get("entity", ""))
         if entity_id is None:
-            print(f"skipping fact: unknown entity '{entity_name}'")
+            report["failed_items"].append({
+                "item_kind": "fact",
+                "reason": "unknown_entity",
+                "detail": {"entity": fact.get("entity", ""), "text": fact.get("text", "")[:80]},
+            })
             continue
         scored = scorer.score_fact(fact)
         cur = con.execute(
             "INSERT INTO facts (entity_id, text, confidence, scorer_version, created_at) VALUES (?,?,?,?,?)",
             (entity_id, fact.get("text", ""), scored["confidence"], scored["scorer_version"], now),
         )
-        con.execute("INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('fact',?,?,?)",
-                    (cur.lastrowid, obs_id, now))
+        con.execute(
+            "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('fact',?,?,?)",
+            (cur.lastrowid, obs_id, now),
+        )
+        report["facts_written"] += 1
+
+    return report
 
 
 def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
