@@ -1,6 +1,7 @@
 """claude-jsonl provider — scan ~/.claude/projects/*.jsonl → Observations."""
 
 import hashlib
+import httpx
 import json
 import sys
 from pathlib import Path
@@ -111,8 +112,18 @@ def scan_file(path: Path) -> Iterator[dict]:
                 yield obs
 
 
+def post_batch(pulse_url: str, observations: list[dict]) -> dict:
+    resp = httpx.post(
+        f"{pulse_url}/ingest",
+        json={"observations": observations},
+        timeout=60.0,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"ingest failed {resp.status_code}: {resp.text}")
+    return resp.json()
+
+
 def run(args) -> int:
-    """Entry point called from pulse_ingest.py. M1: scan + count only. Posting added in Task 13."""
     base = Path(args.path).expanduser()
     if not base.exists():
         print(f"path not found: {base}", file=sys.stderr)
@@ -121,13 +132,24 @@ def run(args) -> int:
     files = sorted(base.rglob("*.jsonl")) if base.is_dir() else [base]
     print(f"scanning {len(files)} files under {base}")
 
-    total = 0
+    batch: list[dict] = []
+    total_inserted = total_dup = total_rev = 0
     for f in files:
-        count = 0
-        for _obs in scan_file(f):
-            count += 1
-            total += 1
-        print(f"  {f.relative_to(base) if base.is_dir() else f.name}: {count} observations")
+        for obs in scan_file(f):
+            batch.append(obs)
+            if len(batch) >= args.batch_size:
+                if not args.dry_run:
+                    stats = post_batch(args.pulse_url, batch)
+                    total_inserted += stats.get("inserted", 0)
+                    total_dup += stats.get("duplicates", 0)
+                    total_rev += stats.get("revisions", 0)
+                batch.clear()
 
-    print(f"TOTAL: {total}")
+    if batch and not args.dry_run:
+        stats = post_batch(args.pulse_url, batch)
+        total_inserted += stats.get("inserted", 0)
+        total_dup += stats.get("duplicates", 0)
+        total_rev += stats.get("revisions", 0)
+
+    print(f"DONE: inserted={total_inserted} duplicates={total_dup} revisions={total_rev}")
     return 0
