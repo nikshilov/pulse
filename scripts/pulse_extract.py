@@ -164,7 +164,7 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
         except sqlite3.Error as ex:
             con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
             con.execute(f"RELEASE SAVEPOINT {sp}")
-            _item_failure("entity", str(ex)[:200], {"canonical_name": ent.get("canonical_name", ""), "kind": ent.get("kind", "")})
+            _item_failure("entity", str(ex)[:200], {"index": idx, "canonical_name": ent.get("canonical_name", ""), "kind": ent.get("kind", "")})
 
     # --- events ---
     for idx, ev in enumerate(result.get("events", [])):
@@ -189,7 +189,7 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
         except sqlite3.Error as ex:
             con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
             con.execute(f"RELEASE SAVEPOINT {sp}")
-            _item_failure("event", str(ex)[:200], {"title": ev.get("title", "")})
+            _item_failure("event", str(ex)[:200], {"index": idx, "title": ev.get("title", "")})
 
     # --- relations ---
     for idx, rel in enumerate(result.get("relations", [])):
@@ -214,7 +214,7 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
         except sqlite3.Error as ex:
             con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
             con.execute(f"RELEASE SAVEPOINT {sp}")
-            _item_failure("relation", str(ex)[:200], {"from": rel.get("from", ""), "to": rel.get("to", ""), "kind": rel.get("kind", "")})
+            _item_failure("relation", str(ex)[:200], {"index": idx, "from": rel.get("from", ""), "to": rel.get("to", ""), "kind": rel.get("kind", "")})
 
     # --- facts ---
     for idx, fact in enumerate(result.get("facts", [])):
@@ -239,7 +239,7 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
         except sqlite3.Error as ex:
             con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
             con.execute(f"RELEASE SAVEPOINT {sp}")
-            _item_failure("fact", str(ex)[:200], {"entity": fact.get("entity", ""), "text": fact.get("text", "")[:80]})
+            _item_failure("fact", str(ex)[:200], {"index": idx, "entity": fact.get("entity", ""), "text": fact.get("text", "")[:80]})
 
     return report
 

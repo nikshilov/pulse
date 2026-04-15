@@ -146,3 +146,46 @@ def test_savepoint_isolates_one_bad_entity(tmp_path):
     names = {r[0] for r in con.execute("SELECT canonical_name FROM entities")}
     con.close()
     assert names == {"Anna", "Fedya"}
+
+
+def test_savepoint_isolates_one_bad_relation(tmp_path):
+    """If relation 1 of 3 violates a NOT NULL constraint (kind=None), relations 0 and 2
+    must still be written, and failed_items must record index=1."""
+    db = tmp_path / "p0.db"
+    _apply_migrations(db)
+
+    con = pulse_extract._open_connection(str(db))
+    con.execute(
+        """INSERT INTO observations
+           (source_kind, source_id, content_hash, version, scope, captured_at,
+            observed_at, actors, content_text, metadata, raw_json)
+           VALUES ('claude_jsonl','f:1','h1',1,'shared','2026-04-15T00:00:00Z',
+                   '2026-04-15T00:00:00Z','[]','hello','{}','{}')"""
+    )
+    con.execute("BEGIN IMMEDIATE")
+    result = {
+        "entities": [
+            {"canonical_name": "Anna", "kind": "person"},
+            {"canonical_name": "Fedya", "kind": "person"},
+        ],
+        "events": [],
+        "relations": [
+            {"from": "Anna", "to": "Fedya", "kind": "friend", "strength": 0.8},
+            # kind=None violates NOT NULL on relations.kind — must be skipped, not abort
+            {"from": "Anna", "to": "Fedya", "kind": None, "strength": 0.5},
+            {"from": "Fedya", "to": "Anna", "kind": "friend", "strength": 0.8},
+        ],
+        "facts": [],
+    }
+    report = pulse_extract._apply_extraction(con, 1, result)
+    con.execute("COMMIT")
+
+    assert report["relations_written"] == 2, "good relations (idx 0 and 2) must both commit"
+    bad = [f for f in report["failed_items"] if f["item_kind"] == "relation"]
+    assert len(bad) == 1
+    assert bad[0]["detail"]["index"] == 1
+    assert bad[0]["item_kind"] == "relation"
+
+    rel_kinds = [r[0] for r in con.execute("SELECT kind FROM relations ORDER BY id")]
+    con.close()
+    assert rel_kinds == ["friend", "friend"]
