@@ -29,7 +29,13 @@ func (h *Handler) upsert(ctx context.Context, obs *capture.Observation) (op, int
 
 	if err == sql.ErrNoRows {
 		id, err := insertObservation(ctx, db, obs)
-		return opInsert, id, err
+		if err != nil {
+			return 0, 0, err
+		}
+		if err := enqueueExtractionJob(ctx, db, id); err != nil {
+			return 0, 0, fmt.Errorf("enqueue: %w", err)
+		}
+		return opInsert, id, nil
 	}
 	if err != nil {
 		return 0, 0, err
@@ -59,7 +65,21 @@ func (h *Handler) upsert(ctx context.Context, obs *capture.Observation) (op, int
 	); err != nil {
 		return 0, 0, fmt.Errorf("record revision: %w", err)
 	}
+	if err := enqueueExtractionJob(ctx, db, newID); err != nil {
+		return 0, 0, fmt.Errorf("enqueue: %w", err)
+	}
 	return opRevision, newID, nil
+}
+
+func enqueueExtractionJob(ctx context.Context, db *sql.DB, obsID int64) error {
+	ids, _ := json.Marshal([]int64{obsID})
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO extraction_jobs (observation_ids, state, attempts, created_at, updated_at)
+		VALUES (?, 'pending', 0, ?, ?)`,
+		string(ids), now, now,
+	)
+	return err
 }
 
 func insertObservation(ctx context.Context, db *sql.DB, obs *capture.Observation) (int64, error) {
