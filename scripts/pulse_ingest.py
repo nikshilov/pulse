@@ -2,6 +2,7 @@
 """pulse_ingest — batch-import observations into Pulse from local sources."""
 
 import argparse
+import os
 import sys
 
 KNOWN_SOURCES = ["claude-jsonl"]
@@ -27,6 +28,11 @@ def main() -> int:
     )
     p.add_argument("--batch-size", type=int, default=200)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--pulse-key",
+        default=os.environ.get("PULSE_KEY"),
+        help="X-Pulse-Key header value (or set PULSE_KEY env var)",
+    )
     args = p.parse_args()
 
     if args.source == "claude-jsonl":

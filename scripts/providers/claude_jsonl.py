@@ -112,11 +112,13 @@ def scan_file(path: Path) -> Iterator[dict]:
                 yield obs
 
 
-def post_batch(pulse_url: str, observations: list[dict]) -> dict:
+def post_batch(pulse_url: str, observations: list[dict], pulse_key: str | None = None) -> dict:
+    headers = {"X-Pulse-Key": pulse_key} if pulse_key else {}
     resp = httpx.post(
         f"{pulse_url}/ingest",
         json={"observations": observations},
         timeout=60.0,
+        headers=headers,
     )
     if resp.status_code != 200:
         raise RuntimeError(f"ingest failed {resp.status_code}: {resp.text}")
@@ -139,14 +141,14 @@ def run(args) -> int:
             batch.append(obs)
             if len(batch) >= args.batch_size:
                 if not args.dry_run:
-                    stats = post_batch(args.pulse_url, batch)
+                    stats = post_batch(args.pulse_url, batch, pulse_key=getattr(args, "pulse_key", None))
                     total_inserted += stats.get("inserted", 0)
                     total_dup += stats.get("duplicates", 0)
                     total_rev += stats.get("revisions", 0)
                 batch.clear()
 
     if batch and not args.dry_run:
-        stats = post_batch(args.pulse_url, batch)
+        stats = post_batch(args.pulse_url, batch, pulse_key=getattr(args, "pulse_key", None))
         total_inserted += stats.get("inserted", 0)
         total_dup += stats.get("duplicates", 0)
         total_rev += stats.get("revisions", 0)
