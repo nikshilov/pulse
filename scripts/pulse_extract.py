@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from extract import prompts, resolver, scorer
+from extract import tool_schemas
 
 _client_cache = None
 
@@ -50,26 +51,36 @@ def _open_connection(db_path: str) -> sqlite3.Connection:
     return con
 
 
-def call_sonnet_triage(prompt: str, expected_count: int) -> list[dict]:
+def call_sonnet_triage(prompt: str, expected_count: int) -> tuple[list[dict], dict]:
     client = _anthropic_client()
     msg = client.messages.create(
         model=TRIAGE_MODEL,
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
+        tools=[tool_schemas.TRIAGE_TOOL],
+        tool_choice={"type": "tool", "name": "triage_observations"},
     )
-    text = "".join(block.text for block in msg.content if hasattr(block, "text"))
-    return prompts.parse_triage_response(text, expected_count)
+    usage = {"input_tokens": msg.usage.input_tokens, "output_tokens": msg.usage.output_tokens, "model": TRIAGE_MODEL}
+    for block in msg.content:
+        if block.type == "tool_use" and block.name == "triage_observations":
+            return block.input["verdicts"], usage
+    raise ValueError("Sonnet did not call triage_observations tool")
 
 
-def call_opus_extract(prompt: str) -> dict:
+def call_opus_extract(prompt: str) -> tuple[dict, dict]:
     client = _anthropic_client()
     msg = client.messages.create(
         model=EXTRACT_MODEL,
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
+        tools=[tool_schemas.EXTRACT_TOOL],
+        tool_choice={"type": "tool", "name": "save_extraction"},
     )
-    text = "".join(block.text for block in msg.content if hasattr(block, "text"))
-    return prompts.parse_extract_response(text)
+    usage = {"input_tokens": msg.usage.input_tokens, "output_tokens": msg.usage.output_tokens, "model": EXTRACT_MODEL}
+    for block in msg.content:
+        if block.type == "tool_use" and block.name == "save_extraction":
+            return block.input, usage
+    raise ValueError("Opus did not call save_extraction tool")
 
 
 def _load_observations(con: sqlite3.Connection, ids: list[int]) -> list[dict]:
@@ -363,7 +374,7 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
                 verdicts = _get_artifact(con, job_id, "triage", None)
                 if verdicts is None:
                     triage_prompt = prompts.build_triage_prompt(observations)
-                    verdicts = call_sonnet_triage(triage_prompt, expected_count=len(observations))
+                    verdicts, _triage_usage = call_sonnet_triage(triage_prompt, expected_count=len(observations))
                     _save_artifact(con, job_id, "triage", None, verdicts, TRIAGE_MODEL)
                 job_reports: list[dict] = []
 
@@ -378,7 +389,7 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
                     if result is None:
                         graph_ctx = {"existing_entities": _load_existing_entities(con)}
                         extract_prompt = prompts.build_extract_prompt(obs, graph_ctx)
-                        result = call_opus_extract(extract_prompt)
+                        result, _extract_usage = call_opus_extract(extract_prompt)
                         _save_artifact(con, job_id, "extract", obs["id"], result, EXTRACT_MODEL)
 
                     con.execute("BEGIN IMMEDIATE")
