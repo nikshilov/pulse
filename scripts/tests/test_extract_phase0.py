@@ -8,7 +8,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pulse_extract
-from extract import prompts
+
+MOCK_USAGE = {"input_tokens": 0, "output_tokens": 0, "model": "test"}
 
 MIGRATIONS = Path(__file__).resolve().parents[2] / "internal" / "store" / "migrations"
 
@@ -222,7 +223,7 @@ def test_crash_in_obs_two_preserves_obs_one_writes(tmp_path, monkeypatch):
 
     # Triage: both obs return "extract"
     def fake_triage(_prompt, expected_count):
-        return [{"verdict": "extract"} for _ in range(expected_count)]
+        return ([{"verdict": "extract"} for _ in range(expected_count)], MOCK_USAGE)
 
     # Extract for obs 1 writes Anna; extract for obs 2 raises RuntimeError
     call_count = {"n": 0}
@@ -230,10 +231,13 @@ def test_crash_in_obs_two_preserves_obs_one_writes(tmp_path, monkeypatch):
     def fake_extract(_prompt):
         call_count["n"] += 1
         if call_count["n"] == 1:
-            return {
-                "entities": [{"canonical_name": "Anna", "kind": "person"}],
-                "events": [], "relations": [], "facts": [],
-            }
+            return (
+                {
+                    "entities": [{"canonical_name": "Anna", "kind": "person"}],
+                    "events": [], "relations": [], "facts": [],
+                },
+                MOCK_USAGE,
+            )
         raise RuntimeError("simulated Anthropic timeout")
 
     monkeypatch.setattr(pulse_extract, "call_sonnet_triage", fake_triage)
@@ -278,7 +282,7 @@ def test_job_state_running_commits_before_apply(tmp_path, monkeypatch):
     con.close()
 
     def fake_triage(_prompt, expected_count):
-        return [{"verdict": "extract"}]
+        return ([{"verdict": "extract"}], MOCK_USAGE)
 
     # Capture job state at the moment extract is called
     captured = {}
