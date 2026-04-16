@@ -51,13 +51,13 @@ func run(dataDir, addr string) error {
 		return errors.New("ANTHROPIC_API_KEY env var is required")
 	}
 
-	db, err := store.Open(cfg.DBPath)
+	s, err := store.Open(cfg.DBPath)
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer s.Close()
 
-	ob := outbox.New(db, 30*time.Second)
+	ob := outbox.New(s.DB(), 30*time.Second)
 	cc := claude.New(cfg.AnthropicAPIKey)
 
 	soulPath := filepath.Join(dataDir, "soul.md")
@@ -72,6 +72,7 @@ func run(dataDir, addr string) error {
 		Builder:      builder,
 		Claude:       cc,
 		DefaultModel: defaultModel,
+		Store:        s,
 	})
 	if err != nil {
 		return err

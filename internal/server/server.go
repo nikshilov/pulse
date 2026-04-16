@@ -10,8 +10,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/nkkmnk/pulse/internal/claude"
+	"github.com/nkkmnk/pulse/internal/ingest"
 	"github.com/nkkmnk/pulse/internal/outbox"
 	"github.com/nkkmnk/pulse/internal/prompt"
+	"github.com/nkkmnk/pulse/internal/store"
 )
 
 // ClaudeAPI is the subset of claude.Client we need. Allows fakes in tests.
@@ -26,6 +28,7 @@ type Config struct {
 	Builder      *prompt.Builder
 	Claude       ClaudeAPI
 	DefaultModel string
+	Store        *store.Store
 }
 
 // Server wraps the chi router.
@@ -52,6 +55,9 @@ func (s *Server) Handler() http.Handler {
 	r.Get("/outbox", s.handleOutboxList)
 	r.Post("/outbox/ack", s.handleOutboxAck)
 	r.Post("/msg", s.handleMsg)
+	if s.cfg.Store != nil {
+		r.Method(http.MethodPost, "/ingest", ingest.NewHandler(s.cfg.Store))
+	}
 	return r
 }
 
