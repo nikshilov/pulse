@@ -1,0 +1,4 @@
+{"type":"user","timestamp":"2025-11-14T10:00:00Z","message":{"content":"привет"},"cwd":"/Users/nikshilov/dev/Garden","sessionId":"sess-a"}
+{"type":"assistant","timestamp":"2025-11-14T10:00:02Z","message":{"content":[{"type":"text","text":"Привет, Ник."}]},"cwd":"/Users/nikshilov/dev/Garden","sessionId":"sess-a"}
+{"type":"assistant","timestamp":"2025-11-14T10:00:03Z","message":{"content":[{"type":"tool_use","name":"Read","input":{}}]},"cwd":"/Users/nikshilov/dev/Garden","sessionId":"sess-a"}
+{"type":"user","timestamp":"2025-11-14T10:00:05Z","message":{"content":"test"},"isMeta":true,"sessionId":"sess-a"}

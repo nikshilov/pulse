@@ -11,12 +11,12 @@ import (
 func newTestOutbox(t *testing.T) *Outbox {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	db, err := store.Open(dbPath)
+	s, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
-	return New(db, 30*time.Second)
+	t.Cleanup(func() { s.Close() })
+	return New(s.DB(), 30*time.Second)
 }
 
 func TestEnqueueDedupes(t *testing.T) {
