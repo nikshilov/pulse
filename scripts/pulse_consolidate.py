@@ -6,7 +6,7 @@ import json
 import math
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
 
@@ -150,7 +150,10 @@ def _should_skip(con: sqlite3.Connection) -> dict | None:
     new_evidence = con.execute(
         "SELECT COUNT(*) FROM evidence WHERE created_at > ?", (last_ts,)
     ).fetchone()[0]
-    if new_entities == 0 and new_evidence < 3:
+    new_events = con.execute(
+        "SELECT COUNT(*) FROM events WHERE ts > ?", (last_ts,)
+    ).fetchone()[0]
+    if new_entities == 0 and new_evidence < 3 and new_events == 0:
         return {"skipped": True, "reason": "no significant changes since last consolidation"}
     return None
 
@@ -212,7 +215,6 @@ def detect_knowledge_gaps(con: sqlite3.Connection, min_mentions: int = 3, max_fa
 
 
 def auto_populate_questions(con: sqlite3.Connection, gaps: list[dict], ttl_days: int = 30) -> int:
-    from datetime import timedelta
     now = datetime.now(timezone.utc)
     ttl = (now + timedelta(days=ttl_days)).isoformat()
     now_iso = now.isoformat()
@@ -314,9 +316,14 @@ def extraction_efficiency(con: sqlite3.Connection) -> dict:
 def run_consolidation(db_path: str) -> dict:
     con = _open_connection(db_path)
 
+    # Task 6: salience decay always runs (time-dependent, not data-dependent)
+    decay_count = decay_salience(con)
+
     # Task 3: skip-guard
     skip = _should_skip(con)
     if skip:
+        skip["salience_decayed"] = decay_count
+        _set_metadata(con, "last_consolidation_ts", datetime.now(timezone.utc).isoformat())
         con.close()
         return skip
 
@@ -331,9 +338,6 @@ def run_consolidation(db_path: str) -> dict:
     # Task 5: knowledge gaps
     gaps = detect_knowledge_gaps(con)
     questions_added = auto_populate_questions(con, gaps)
-
-    # Task 6: salience decay
-    decay_count = decay_salience(con)
 
     # Task 7: observability
     trend = valence_trend(con)
