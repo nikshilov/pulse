@@ -44,7 +44,7 @@ def retrieve_context(
                     continue
                 visited.add(neighbor_id)
 
-                neighbor = _get_entity_full(con, neighbor_id, seed_ids)
+                neighbor = _get_entity_full(con, neighbor_id)
                 if neighbor is None:
                     continue
 
@@ -107,7 +107,7 @@ def _match_entities(con: sqlite3.Connection, tokens: list[str]) -> list[dict]:
 
 
 def _get_entity_full(
-    con: sqlite3.Connection, entity_id: int, seed_ids: set[int]
+    con: sqlite3.Connection, entity_id: int
 ) -> dict | None:
     """Fetch a single entity by ID for BFS-discovered entities."""
     row = con.execute(
