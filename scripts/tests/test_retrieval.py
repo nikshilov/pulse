@@ -222,6 +222,50 @@ def test_rank_anchor_boost_for_emotional_persons(tmp_path):
     assert result["matched_entities"][0]["canonical_name"] == "PersonA"
 
 
+def test_bfs_skips_do_not_probe_neighbor(tmp_path):
+    """A→B→C chain where B has do_not_probe=1: seeding by A at depth=2 must NOT return B or C.
+
+    B is the blocker — BFS refuses to yield B as a neighbor at all, so C (reachable
+    only through B) never gets discovered. This is the structural safety gate for
+    graph expansion: entities behind the opt-out are invisible to retrieval.
+    """
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, do_not_probe) "
+        "VALUES (1, 'Alpha',   'person', ?, ?, ?, 0.9, 0)",
+        (json.dumps([]), now, now),
+    )
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, do_not_probe) "
+        "VALUES (2, 'BlockedBravo', 'person', ?, ?, ?, 0.9, 1)",
+        (json.dumps([]), now, now),
+    )
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, do_not_probe) "
+        "VALUES (3, 'Charlie', 'person', ?, ?, ?, 0.9, 0)",
+        (json.dumps([]), now, now),
+    )
+    # A → B (strong), B → C (strong)
+    con.execute(
+        "INSERT INTO relations (from_entity_id, to_entity_id, kind, strength, first_seen, last_seen) "
+        "VALUES (1, 2, 'knows', 1.0, ?, ?)", (now, now),
+    )
+    con.execute(
+        "INSERT INTO relations (from_entity_id, to_entity_id, kind, strength, first_seen, last_seen) "
+        "VALUES (2, 3, 'knows', 1.0, ?, ?)", (now, now),
+    )
+
+    result = retrieve_context(con, "Alpha", depth=2)
+    names = [e["canonical_name"] for e in result["matched_entities"]]
+    assert "Alpha" in names
+    # B is the neighbor that should be suppressed — neither returned itself …
+    assert "BlockedBravo" not in names
+    # … nor used as a bridge to reach C.
+    assert "Charlie" not in names
+
+
 def test_rank_kind_aware_decay_concept_fades_faster(tmp_path):
     """Concept (λ=0.01) 100 days stale loses to person (λ=0.001) 100 days stale."""
     from extract.retrieval import retrieve_context

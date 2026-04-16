@@ -204,35 +204,60 @@ def test_auto_populate_questions(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Task 6: Salience Decay
+# Safety gates (migration 009 — do_not_probe + emotional_weight)
 # ---------------------------------------------------------------------------
 
-def test_decay_salience_reduces_stale_entities(tmp_path):
-    from pulse_consolidate import decay_salience
-    con, _ = _fresh_db(tmp_path)
-    old_date = "2020-01-01T00:00:00Z"
-    recent_date = "2026-04-16T00:00:00Z"
-    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen, salience_score) VALUES (1,'OldFriend','person',?,?,0.8)", (old_date, old_date))
-    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen, salience_score) VALUES (2,'NewFriend','person',?,?,0.8)", (recent_date, recent_date))
-    updated = decay_salience(con)
-    assert updated >= 1
-    old_salience = con.execute("SELECT salience_score FROM entities WHERE id=1").fetchone()[0]
-    new_salience = con.execute("SELECT salience_score FROM entities WHERE id=2").fetchone()[0]
-    assert old_salience < 0.8
-    assert old_salience >= 0.05
-    assert new_salience == 0.8
+def _seed_gap_entity(con, entity_id, name, emotional_weight=0.0, do_not_probe=0, mentions=5):
+    """Helper: entity with enough mentions + zero facts to trip knowledge_gaps."""
+    now = "2026-04-16T00:00:00Z"
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen, "
+        "                      emotional_weight, do_not_probe) "
+        "VALUES (?, ?, 'person', ?, ?, ?, ?)",
+        (entity_id, name, now, now, emotional_weight, do_not_probe),
+    )
+    for i in range(mentions):
+        # unique event ids per entity to avoid PK collisions across helper calls
+        eid = entity_id * 1000 + i
+        con.execute("INSERT INTO events (id, title, ts) VALUES (?, ?, ?)", (eid, f"e{eid}", now))
+        con.execute("INSERT INTO event_entities (event_id, entity_id) VALUES (?, ?)", (eid, entity_id))
 
 
-def test_decay_salience_respects_kind_rates(tmp_path):
-    from pulse_consolidate import decay_salience
+def test_auto_question_skips_emotionally_heavy_entity(tmp_path):
+    """Entity with emotional_weight=0.8 (Anna/Kristina-class) must NOT get an auto-question.
+
+    Even if it structurally qualifies (≥3 mentions, ≤1 fact) the emotion gate blocks it.
+    Elle does not initiate about wounds on a random Tuesday.
+    """
+    from pulse_consolidate import detect_knowledge_gaps, auto_populate_questions
     con, _ = _fresh_db(tmp_path)
-    old_date = "2025-01-01T00:00:00Z"
-    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen, salience_score) VALUES (1,'PersonX','person',?,?,0.8)", (old_date, old_date))
-    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen, salience_score) VALUES (2,'ConceptY','concept',?,?,0.8)", (old_date, old_date))
-    decay_salience(con)
-    person_s = con.execute("SELECT salience_score FROM entities WHERE id=1").fetchone()[0]
-    concept_s = con.execute("SELECT salience_score FROM entities WHERE id=2").fetchone()[0]
-    assert concept_s < person_s
+    _seed_gap_entity(con, 1, "Kristina", emotional_weight=0.8, do_not_probe=0, mentions=5)
+
+    gaps = detect_knowledge_gaps(con)
+    # Gap is detected (structurally valid) …
+    assert any(g["entity_id"] == 1 for g in gaps)
+    # … but auto_populate_questions skips it on the emotion gate.
+    added = auto_populate_questions(con, gaps)
+    assert added == 0
+    rows = con.execute("SELECT COUNT(*) FROM open_questions WHERE subject_entity_id = 1").fetchone()[0]
+    assert rows == 0
+
+
+def test_auto_question_skips_do_not_probe_entity(tmp_path):
+    """Entity with do_not_probe=1 must NOT appear in knowledge_gaps at all (SQL-level gate)."""
+    from pulse_consolidate import detect_knowledge_gaps, auto_populate_questions
+    con, _ = _fresh_db(tmp_path)
+    _seed_gap_entity(con, 1, "OptedOut", emotional_weight=0.0, do_not_probe=1, mentions=5)
+
+    gaps = detect_knowledge_gaps(con)
+    assert all(g["entity_id"] != 1 for g in gaps)
+
+    # Even if the filter were bypassed, auto_populate_questions on an empty gap list
+    # must create nothing. Belt and suspenders.
+    added = auto_populate_questions(con, gaps)
+    assert added == 0
+    rows = con.execute("SELECT COUNT(*) FROM open_questions WHERE subject_entity_id = 1").fetchone()[0]
+    assert rows == 0
 
 
 # ---------------------------------------------------------------------------

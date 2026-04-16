@@ -29,9 +29,9 @@ from datetime import datetime, timezone
 #   concept λ=0.01   → t½ ≈  69d (abstract concepts decay fastest)
 #   default λ=0.005
 #
-# These MUST match scripts/pulse_consolidate.py:DECAY_RATES. Duplicated here to avoid
-# a cross-module import between scripts/ and scripts/extract/. If you change one,
-# change the other — or factor into a shared module.
+# This is the single source of truth for decay. Mutation-based decay was removed
+# from pulse_consolidate.py — decay is now applied non-destructively at read time
+# inside `_rank` below.
 DECAY_RATES = {
     "person": 0.001,
     "project": 0.005,
@@ -169,13 +169,25 @@ def _get_entity_full(
 
 
 def _get_neighbor_ids(con: sqlite3.Connection, entity_id: int) -> list[int]:
-    """Return IDs of entities connected via strong-enough relations (strength > 0.3, limit 5)."""
+    """Return IDs of entities connected via strong-enough relations (strength > 0.3, limit 5).
+
+    Safety: neighbors with `do_not_probe = 1` are excluded. This is a structural gate —
+    emotionally heavy people who are NOT opted out are still reachable (they're often
+    exactly who the message is about). Only the user-set opt-out blocks BFS traversal.
+    Because the blocked neighbor is never yielded, the BFS also stops expanding
+    through it — entities reachable only through an opt-out node become invisible to
+    retrieval (the intended behaviour).
+    """
     rows = con.execute(
-        "SELECT CASE WHEN from_entity_id = ? THEN to_entity_id ELSE from_entity_id END "
-        "FROM relations "
-        "WHERE (from_entity_id = ? OR to_entity_id = ?) AND strength > 0.3 "
-        "ORDER BY strength DESC LIMIT 5",
-        (entity_id, entity_id, entity_id),
+        "SELECT CASE WHEN r.from_entity_id = ? THEN r.to_entity_id ELSE r.from_entity_id END AS neighbor_id "
+        "FROM relations r "
+        "JOIN entities ne ON ne.id = "
+        "    (CASE WHEN r.from_entity_id = ? THEN r.to_entity_id ELSE r.from_entity_id END) "
+        "WHERE (r.from_entity_id = ? OR r.to_entity_id = ?) "
+        "  AND r.strength > 0.3 "
+        "  AND ne.do_not_probe = 0 "
+        "ORDER BY r.strength DESC LIMIT 5",
+        (entity_id, entity_id, entity_id, entity_id),
     ).fetchall()
     return [r[0] for r in rows]
 
