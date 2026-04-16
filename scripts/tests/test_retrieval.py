@@ -266,6 +266,76 @@ def test_bfs_skips_do_not_probe_neighbor(tmp_path):
     assert "Charlie" not in names
 
 
+def test_rank_skips_do_not_probe_entity_in_results(tmp_path):
+    """A direct-name match that is flagged `do_not_probe=1` must not appear in the
+    ranked results at all. Judge 2/6 observation: the BFS gate alone is half-done;
+    a trauma entity directly named in the message was still landing in top-k as a
+    seed match. Seed-level gating closes that hole.
+    """
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    # Optout entity has a strong salience and is directly aliased to the query term.
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight, do_not_probe) "
+        "VALUES (1, 'Kristina', 'person', ?, ?, ?, 0.9, 0.95, 1)",
+        (json.dumps(["Кристина"]), now, now),
+    )
+    # A safe companion match on the same token so total_matched != 0 baseline stays meaningful.
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score) "
+        "VALUES (2, 'SafeOne', 'person', ?, ?, ?, 0.4)",
+        (json.dumps(["Кристина"]), now, now),
+    )
+    result = retrieve_context(con, "Кристина")
+    names = [e["canonical_name"] for e in result["matched_entities"]]
+    assert "Kristina" not in names
+    assert "SafeOne" in names
+
+
+def test_rank_self_entity_no_anchor_boost(tmp_path):
+    """Two equal persons (same salience, self has higher emo): non-self still wins
+    because self-entity has anchor stripped to 1.0 while non-self gets 1.5 boost.
+    Judge 1/6 observation: bench had Nik top-1 in 11/15 queries regardless of
+    subject because anchor×1.5 on the self-entity dominated every rank contest.
+    """
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    # Self: salience=0.8, emo=0.9 → (0.8+0.9)*recency*1.0 = 1.7
+    # Other: salience=0.8, emo=0.7 → (0.8+0.7)*recency*1.5 = 2.25
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight, is_self) "
+        "VALUES (1, 'Nik', 'person', ?, ?, ?, 0.8, 0.9, 1)",
+        (json.dumps(["target"]), now, now),
+    )
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight, is_self) "
+        "VALUES (2, 'Anna', 'person', ?, ?, ?, 0.8, 0.7, 0)",
+        (json.dumps(["target"]), now, now),
+    )
+    result = retrieve_context(con, "target")
+    # Anna ranks first: anchor boost applies to her, not to the self-entity Nik.
+    assert result["matched_entities"][0]["canonical_name"] == "Anna"
+
+
+def test_self_entity_still_appears_when_directly_matched(tmp_path):
+    """Stripping the anchor boost must NOT exclude the self-entity from results —
+    Nik can still appear when directly named, just without anchor pressure.
+    """
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight, is_self) "
+        "VALUES (1, 'Nik', 'person', ?, ?, ?, 1.0, 0.9, 1)",
+        (json.dumps(["Никита"]), now, now),
+    )
+    result = retrieve_context(con, "Никита")
+    names = [e["canonical_name"] for e in result["matched_entities"]]
+    assert "Nik" in names
+
+
 def test_rank_kind_aware_decay_concept_fades_faster(tmp_path):
     """Concept (λ=0.01) 100 days stale loses to person (λ=0.001) 100 days stale."""
     from extract.retrieval import retrieve_context
