@@ -522,7 +522,7 @@ def test_triage_artifact_saved_after_sonnet_call(tmp_path, monkeypatch):
     con.close()
 
     monkeypatch.setattr(pulse_extract, "call_sonnet_triage",
-                        lambda _p, expected_count: ([{"verdict": "skip"} for _ in range(expected_count)], MOCK_USAGE))
+                        lambda _p, expected_count, **_kw: ([{"verdict": "skip"} for _ in range(expected_count)], MOCK_USAGE))
 
     pulse_extract.run_once(str(db))
 
@@ -592,11 +592,11 @@ def test_extract_artifact_saved_after_opus_call_per_obs(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         pulse_extract, "call_sonnet_triage",
-        lambda _p, expected_count: ([{"verdict": "extract"} for _ in range(expected_count)], MOCK_USAGE),
+        lambda _p, expected_count, **_kw: ([{"verdict": "extract"} for _ in range(expected_count)], MOCK_USAGE),
     )
     call_ids: list = []
 
-    def fake_extract(_prompt):
+    def fake_extract(_prompt, **_kw):
         call_ids.append(len(call_ids) + 1)
         return (
             {
@@ -651,7 +651,7 @@ def test_restart_reuses_extract_artifact_per_obs(tmp_path, monkeypatch):
                         lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("no triage expected")))
     opus_calls: list = []
 
-    def fake_opus(_prompt):
+    def fake_opus(_prompt, **_kw):
         opus_calls.append(_prompt)
         return (
             {

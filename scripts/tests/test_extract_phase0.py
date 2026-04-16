@@ -222,13 +222,13 @@ def test_crash_in_obs_two_preserves_obs_one_writes(tmp_path, monkeypatch):
     con.close()
 
     # Triage: both obs return "extract"
-    def fake_triage(_prompt, expected_count):
+    def fake_triage(_prompt, expected_count, **_kw):
         return ([{"verdict": "extract"} for _ in range(expected_count)], MOCK_USAGE)
 
     # Extract for obs 1 writes Anna; extract for obs 2 raises RuntimeError
     call_count = {"n": 0}
 
-    def fake_extract(_prompt):
+    def fake_extract(_prompt, **_kw):
         call_count["n"] += 1
         if call_count["n"] == 1:
             return (
@@ -281,13 +281,13 @@ def test_job_state_running_commits_before_apply(tmp_path, monkeypatch):
     con.commit()
     con.close()
 
-    def fake_triage(_prompt, expected_count):
+    def fake_triage(_prompt, expected_count, **_kw):
         return ([{"verdict": "extract"}], MOCK_USAGE)
 
     # Capture job state at the moment extract is called
     captured = {}
 
-    def fake_extract(_prompt):
+    def fake_extract(_prompt, **_kw):
         probe = sqlite3.connect(db)
         probe.execute("PRAGMA busy_timeout=2000")
         row = probe.execute("SELECT state, attempts FROM extraction_jobs WHERE id=1").fetchone()

@@ -3,12 +3,22 @@
 
 Reads pending extraction_jobs, runs Sonnet triage + Opus extract, writes
 entities/relations/events/facts/evidence, advances job state.
+
+Cost controls (2026-04, FinOps pass):
+- Prompt caching via `cache_control: {type: "ephemeral"}` on the static prefix
+  of both triage and extract prompts, and on the tool definition.
+- Top-K candidate entities (not full table) shipped into the Opus prompt.
+- Live budget gate: reads today's spend from `extraction_metrics.cost_usd`
+  before every Anthropic call and aborts mid-batch if we cross the budget.
+- Per-call `cost_usd` computed from token usage + model pricing and persisted
+  to `extraction_metrics` on every insert.
 """
 
 import anthropic
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -22,6 +32,62 @@ _client_cache = None
 
 TRIAGE_MODEL = "claude-sonnet-4-6"
 EXTRACT_MODEL = "claude-opus-4-6"
+
+# Conservative worst-case estimate for "one more Opus extract call" used by the
+# pre-flight budget gate. Calibrated at ~800 output tokens + typical cached
+# input. If real spend consistently lands much lower, tune this down.
+WORST_CASE_NEXT_JOB_USD = 0.10
+
+# Anthropic pricing as of 2026-04 (per 1M tokens, USD). Cache write = 1.25×
+# input, cache read = 0.1× input.
+PRICING = {
+    "claude-sonnet-4-6": {
+        "input_per_1m": 3.00,
+        "output_per_1m": 15.00,
+        "cache_write_mult": 1.25,
+        "cache_read_mult": 0.10,
+    },
+    "claude-opus-4-6": {
+        "input_per_1m": 15.00,
+        "output_per_1m": 75.00,
+        "cache_write_mult": 1.25,
+        "cache_read_mult": 0.10,
+    },
+}
+
+
+def _compute_cost_usd(usage: dict) -> float:
+    """Compute USD cost from an Anthropic usage dict.
+
+    usage keys consumed:
+      - model (required to look up pricing; unknown → $0)
+      - input_tokens, output_tokens
+      - cache_creation_input_tokens (billed at cache_write_mult × input rate)
+      - cache_read_input_tokens (billed at cache_read_mult × input rate)
+    """
+    p = PRICING.get(usage.get("model"))
+    if not p:
+        return 0.0
+    in_tok = usage.get("input_tokens", 0) or 0
+    out_tok = usage.get("output_tokens", 0) or 0
+    cw = usage.get("cache_creation_input_tokens", 0) or 0
+    cr = usage.get("cache_read_input_tokens", 0) or 0
+    cost = (
+        in_tok * p["input_per_1m"] / 1_000_000
+        + out_tok * p["output_per_1m"] / 1_000_000
+        + cw * p["input_per_1m"] * p["cache_write_mult"] / 1_000_000
+        + cr * p["input_per_1m"] * p["cache_read_mult"] / 1_000_000
+    )
+    return round(cost, 6)
+
+
+def _today_spend_usd(con: sqlite3.Connection) -> float:
+    """Sum today's extraction_metrics.cost_usd (UTC date window)."""
+    row = con.execute(
+        "SELECT COALESCE(SUM(cost_usd), 0) FROM extraction_metrics "
+        "WHERE created_at >= DATE('now')"
+    ).fetchone()
+    return float(row[0] or 0.0)
 
 
 def _anthropic_client():
@@ -51,36 +117,99 @@ def _open_connection(db_path: str) -> sqlite3.Connection:
     return con
 
 
-def call_sonnet_triage(prompt: str, expected_count: int) -> tuple[list[dict], dict]:
+def _extract_tool_with_cache() -> dict:
+    """Return EXTRACT_TOOL with cache_control marker on the definition.
+
+    Cache-control on tool schemas saves ~600 tokens per call — the JSON Schema
+    for save_extraction is long and identical every call.
+    """
+    return {**tool_schemas.EXTRACT_TOOL, "cache_control": {"type": "ephemeral"}}
+
+
+def _triage_tool_with_cache() -> dict:
+    return {**tool_schemas.TRIAGE_TOOL, "cache_control": {"type": "ephemeral"}}
+
+
+def call_sonnet_triage(prompt: str, expected_count: int,
+                       dynamic_suffix: str | None = None) -> tuple[list[dict], dict]:
+    """Call Sonnet triage with prompt caching.
+
+    Backward-compatible: if `dynamic_suffix` is None, the caller passed a
+    single combined string via `prompt` and we split it heuristically — the
+    full string is sent as dynamic (no cache hit, but also no regression).
+
+    Preferred: pass `prompt` = static prefix and `dynamic_suffix` = dynamic tail
+    (as returned by `prompts.build_triage_prompt_parts`).
+    """
     client = _anthropic_client()
+    if dynamic_suffix is None:
+        # Legacy single-string path. Don't try to cache — we don't know the split.
+        content = [{"type": "text", "text": prompt}]
+    else:
+        content = [
+            {"type": "text", "text": prompt,
+             "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": dynamic_suffix},
+        ]
     msg = client.messages.create(
         model=TRIAGE_MODEL,
         max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-        tools=[tool_schemas.TRIAGE_TOOL],
+        messages=[{"role": "user", "content": content}],
+        tools=[_triage_tool_with_cache()],
         tool_choice={"type": "tool", "name": "triage_observations"},
     )
-    usage = {"input_tokens": msg.usage.input_tokens, "output_tokens": msg.usage.output_tokens, "model": TRIAGE_MODEL}
+    usage = _usage_from_msg(msg, TRIAGE_MODEL)
     for block in msg.content:
         if block.type == "tool_use" and block.name == "triage_observations":
             return block.input["verdicts"], usage
     raise ValueError("Sonnet did not call triage_observations tool")
 
 
-def call_opus_extract(prompt: str) -> tuple[dict, dict]:
+def call_opus_extract(prompt: str, dynamic_suffix: str | None = None) -> tuple[dict, dict]:
+    """Call Opus extract with prompt caching.
+
+    Same shape as `call_sonnet_triage`: either pass a single combined prompt
+    (legacy, uncached) or pass `prompt` = static prefix + `dynamic_suffix` =
+    variable tail (cached static prefix).
+    """
     client = _anthropic_client()
+    if dynamic_suffix is None:
+        content = [{"type": "text", "text": prompt}]
+    else:
+        content = [
+            {"type": "text", "text": prompt,
+             "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": dynamic_suffix},
+        ]
     msg = client.messages.create(
         model=EXTRACT_MODEL,
         max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}],
-        tools=[tool_schemas.EXTRACT_TOOL],
+        messages=[{"role": "user", "content": content}],
+        tools=[_extract_tool_with_cache()],
         tool_choice={"type": "tool", "name": "save_extraction"},
     )
-    usage = {"input_tokens": msg.usage.input_tokens, "output_tokens": msg.usage.output_tokens, "model": EXTRACT_MODEL}
+    usage = _usage_from_msg(msg, EXTRACT_MODEL)
     for block in msg.content:
         if block.type == "tool_use" and block.name == "save_extraction":
             return block.input, usage
     raise ValueError("Opus did not call save_extraction tool")
+
+
+def _usage_from_msg(msg, model: str) -> dict:
+    """Extract usage dict from an Anthropic message, including cache tokens.
+
+    Cache counters are on usage for cached calls; absent on uncached. Use
+    getattr with a 0 default so the mock-heavy test suite (which doesn't set
+    these) still computes correct costs from input/output.
+    """
+    u = msg.usage
+    return {
+        "input_tokens": getattr(u, "input_tokens", 0) or 0,
+        "output_tokens": getattr(u, "output_tokens", 0) or 0,
+        "cache_creation_input_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", 0) or 0,
+        "model": model,
+    }
 
 
 def _load_observations(con: sqlite3.Connection, ids: list[int]) -> list[dict]:
@@ -98,11 +227,88 @@ def _load_observations(con: sqlite3.Connection, ids: list[int]) -> list[dict]:
 
 
 def _load_existing_entities(con: sqlite3.Connection) -> list[dict]:
+    """Full-table scan of entities. Used for resolver matching inside
+    `_apply_extraction` where we need ALL candidate entities to decide
+    bind_identity vs proposal. DO NOT use in prompt construction — use
+    `_load_candidate_entities` for that (top-K by relevance).
+    """
     rows = con.execute("SELECT id, canonical_name, kind, aliases FROM entities").fetchall()
     return [
         {"id": r[0], "canonical_name": r[1], "kind": r[2], "aliases": json.loads(r[3] or "[]")}
         for r in rows
     ]
+
+
+# Shared tokenizer with extract/retrieval.py (`_tokenize`). Keep the regex in
+# sync — it's the contract for what counts as a "name-like" token.
+_TOKEN_RE = re.compile(r"\b[\w\-]{2,}\b", re.UNICODE)
+
+
+def _tokenize_observation(text: str) -> set[str]:
+    """Lowercased unigram tokens suitable for candidate-entity matching."""
+    if not text:
+        return set()
+    return {w.lower() for w in _TOKEN_RE.findall(text)}
+
+
+def _load_candidate_entities(
+    con: sqlite3.Connection, observation: dict, top_k: int = 50
+) -> list[dict]:
+    """Return top-K entities relevant to `observation` for the Opus prompt.
+
+    Ranking (two-pass, deterministic):
+      1. Entities whose canonical_name or any alias shares a token with
+         `observation.content_text`, OR whose canonical_name/alias appears in
+         `observation.actors[*].id`. Ordered by salience DESC, last_seen DESC.
+      2. If we still have room under `top_k`, pad with globally top entities
+         by salience DESC, last_seen DESC (for merge/resolution quality).
+
+    The full-table `_load_existing_entities` is still used by `_apply_extraction`
+    for resolver decisions — don't replace it there.
+    """
+    tokens = _tokenize_observation(observation.get("content_text") or "")
+    actor_ids = {
+        str(a.get("id", "")).lower()
+        for a in (observation.get("actors") or [])
+        if a.get("id") is not None
+    }
+    match_set = tokens | actor_ids
+
+    rows = con.execute(
+        "SELECT id, canonical_name, kind, aliases, salience_score, last_seen "
+        "FROM entities ORDER BY salience_score DESC, last_seen DESC"
+    ).fetchall()
+
+    matched: list[dict] = []
+    matched_ids: set[int] = set()
+    leftovers: list[dict] = []
+
+    for eid, name, kind, aliases_json, _sal, _ls in rows:
+        try:
+            aliases = json.loads(aliases_json or "[]")
+        except (json.JSONDecodeError, TypeError):
+            aliases = []
+        ent = {"id": eid, "canonical_name": name, "kind": kind, "aliases": aliases}
+
+        names_lc = {(name or "").lower()} | {(a or "").lower() for a in aliases}
+        if match_set and names_lc & match_set:
+            matched.append(ent)
+            matched_ids.add(eid)
+        else:
+            leftovers.append(ent)
+
+        if len(matched) >= top_k:
+            break
+
+    if len(matched) < top_k:
+        for ent in leftovers:
+            if ent["id"] in matched_ids:
+                continue
+            matched.append(ent)
+            if len(matched) >= top_k:
+                break
+
+    return matched[:top_k]
 
 
 def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dict:
@@ -347,9 +553,22 @@ def _save_artifact(con: sqlite3.Connection, job_id: int, kind: str,
 
 
 def _save_metrics(con: sqlite3.Connection, job_id: int, usage: dict) -> None:
+    """Insert one extraction_metrics row, including computed cost_usd.
+
+    cost_usd is derived from usage + PRICING; we always write it (0.0 for
+    unknown models) so the budget gate has a reliable SUM to read.
+    """
+    cost = _compute_cost_usd(usage)
     con.execute(
-        "INSERT INTO extraction_metrics (job_id, model, input_tokens, output_tokens) VALUES (?,?,?,?)",
-        (job_id, usage.get("model", "unknown"), usage.get("input_tokens"), usage.get("output_tokens")),
+        "INSERT INTO extraction_metrics (job_id, model, input_tokens, output_tokens, cost_usd) "
+        "VALUES (?,?,?,?,?)",
+        (
+            job_id,
+            usage.get("model", "unknown"),
+            usage.get("input_tokens"),
+            usage.get("output_tokens"),
+            cost,
+        ),
     )
 
 
@@ -361,6 +580,19 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
             print("budget exhausted for today — skipping extraction run")
             return 0
 
+        # Pre-flight live budget gate: today's committed spend + worst-case
+        # next-job estimate must fit under budget. Prevents the pathological
+        # cron-every-2-min backlog scenario from burning hundreds of dollars
+        # before anyone notices.
+        today_spend = _today_spend_usd(con)
+        if today_spend + WORST_CASE_NEXT_JOB_USD > budget_usd_remaining:
+            print(
+                f"budget gate fired: today=${today_spend:.2f}, "
+                f"next-job-worst=${WORST_CASE_NEXT_JOB_USD:.2f}, "
+                f"budget=${budget_usd_remaining:.2f}"
+            )
+            return 0
+
         jobs = con.execute(
             "SELECT id, observation_ids FROM extraction_jobs "
             "WHERE state='pending' ORDER BY created_at LIMIT 10"
@@ -370,6 +602,18 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
             return 0
 
         for job_id, obs_ids_json in jobs:
+            # Mid-batch recheck: after each finished job we may have written
+            # $$ to extraction_metrics. If we've crossed budget, abort the
+            # remaining pending jobs (they stay pending, re-tried next run).
+            today_spend = _today_spend_usd(con)
+            if today_spend + WORST_CASE_NEXT_JOB_USD > budget_usd_remaining:
+                print(
+                    f"budget gate fired mid-batch: today=${today_spend:.2f}, "
+                    f"next-job-worst=${WORST_CASE_NEXT_JOB_USD:.2f}, "
+                    f"budget=${budget_usd_remaining:.2f}"
+                )
+                return 0
+
             obs_ids = json.loads(obs_ids_json)
             _set_job_state(con, job_id, "running", increment_attempts=True)
 
@@ -381,8 +625,11 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
             try:
                 verdicts = _get_artifact(con, job_id, "triage", None)
                 if verdicts is None:
-                    triage_prompt = prompts.build_triage_prompt(observations)
-                    verdicts, triage_usage = call_sonnet_triage(triage_prompt, expected_count=len(observations))
+                    triage_static, triage_dynamic = prompts.build_triage_prompt_parts(observations)
+                    verdicts, triage_usage = call_sonnet_triage(
+                        triage_static, expected_count=len(observations),
+                        dynamic_suffix=triage_dynamic,
+                    )
                     _save_artifact(con, job_id, "triage", None, verdicts, TRIAGE_MODEL)
                     _save_metrics(con, job_id, triage_usage)
                 job_reports: list[dict] = []
@@ -396,9 +643,14 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
                         continue
                     result = _get_artifact(con, job_id, "extract", obs["id"])
                     if result is None:
-                        graph_ctx = {"existing_entities": _load_existing_entities(con)}
-                        extract_prompt = prompts.build_extract_prompt(obs, graph_ctx)
-                        result, extract_usage = call_opus_extract(extract_prompt)
+                        candidates = _load_candidate_entities(con, obs, top_k=50)
+                        graph_ctx = {"existing_entities": candidates}
+                        extract_static, extract_dynamic = prompts.build_extract_prompt_parts(
+                            obs, graph_ctx
+                        )
+                        result, extract_usage = call_opus_extract(
+                            extract_static, dynamic_suffix=extract_dynamic,
+                        )
                         _save_artifact(con, job_id, "extract", obs["id"], result, EXTRACT_MODEL)
                         _save_metrics(con, job_id, extract_usage)
 
