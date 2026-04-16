@@ -125,3 +125,35 @@ def test_depth_0_returns_only_matched(tmp_path):
     names = [e["canonical_name"] for e in result["matched_entities"]]
     assert "Anna" in names
     assert "Nik" not in names  # no expansion
+
+
+def test_retrieve_survives_corrupted_aliases_json(tmp_path):
+    """Entity with invalid JSON in aliases column should not crash retrieval."""
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score) "
+        "VALUES (1,'BadEntity','person','NOT VALID JSON',?,?,0.5)", (now, now)
+    )
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score) "
+        "VALUES (2,'GoodEntity','person',?,?,?,0.8)", (json.dumps(["good"]), now, now)
+    )
+    result = retrieve_context(con, "GoodEntity")
+    names = [e["canonical_name"] for e in result["matched_entities"]]
+    assert "GoodEntity" in names
+
+
+def test_retrieve_handles_zero_salience(tmp_path):
+    """Entity with salience_score=0 should not crash ranking."""
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score) "
+        "VALUES (1,'ZeroScore','person',?,?,?,0.0)", (json.dumps([]), now, now)
+    )
+    result = retrieve_context(con, "ZeroScore")
+    assert result["total_matched"] == 1
+    assert result["matched_entities"][0]["salience_score"] == 0.0

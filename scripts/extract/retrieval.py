@@ -87,7 +87,10 @@ def _match_entities(con: sqlite3.Connection, tokens: list[str]) -> list[dict]:
 
     for row in all_entities:
         eid, name, kind, aliases_json, salience, last_seen = row
-        aliases = json.loads(aliases_json) if aliases_json else []
+        try:
+            aliases = json.loads(aliases_json) if aliases_json else []
+        except (json.JSONDecodeError, TypeError):
+            aliases = []
         all_names = [name] + aliases
 
         for token in tokens:
@@ -98,7 +101,7 @@ def _match_entities(con: sqlite3.Connection, tokens: list[str]) -> list[dict]:
                         "canonical_name": name,
                         "kind": kind,
                         "aliases": aliases,
-                        "salience_score": salience,
+                        "salience_score": salience or 0.0,
                         "last_seen": last_seen,
                     }
                 break
@@ -117,13 +120,16 @@ def _get_entity_full(
     if row is None:
         return None
     eid, name, kind, aliases_json, salience, last_seen = row
-    aliases = json.loads(aliases_json) if aliases_json else []
+    try:
+        aliases = json.loads(aliases_json) if aliases_json else []
+    except (json.JSONDecodeError, TypeError):
+        aliases = []
     return {
         "id": eid,
         "canonical_name": name,
         "kind": kind,
         "aliases": aliases,
-        "salience_score": salience,
+        "salience_score": salience or 0.0,
         "last_seen": last_seen,
     }
 
