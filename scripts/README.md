@@ -85,9 +85,13 @@ result = retrieve_context(con, "Как дела у Ани?", top_k=10, depth=2)
 # result = {matched_entities: [...], total_matched: 4, retrieval_method: "keyword", max_depth_used: 2}
 ```
 
-Ранжирование: `salience × recency × hop_penalty`
-- recency = `max(0.1, 1.0 - days_ago/365)`
-- hop_penalty = `0.7 ^ hop` (прямое совпадение → 1.0, через 1 hop → 0.7, через 2 → 0.49)
+Ранжирование (Garden-style, победитель 9-way empathic bench, Apr 2026):
+`score = (salience + emotional_weight) × recency × anchor × hop_penalty`
+- `recency = exp(-λ × days_since_last_seen)` — λ зависит от kind (`DECAY_RATES`):
+  person=0.001 (t½≈693d), place=0.003, project=0.005, concept=0.01 (t½≈69d). Decay только на retrieval, в DB не мутирует
+- `anchor = 1.5` для persons с `emotional_weight > 0.6` (Anna/Sonya/Kristina-class), иначе 1.0 — поднимает эмоционально центральных людей
+- `emotional_weight` аддитивно к salience, не множительно — salience=0.3 emo=0.9 не теряется к salience=0.9 emo=0.0
+- `hop_penalty = 0.7 ^ hop` — прямое совпадение → 1.0, через 1 hop → 0.7, через 2 → 0.49
 
 ### providers/ — Адаптеры источников
 

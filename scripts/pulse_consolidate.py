@@ -7,6 +7,10 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
+from typing import TYPE_CHECKING, Sequence
+
+if TYPE_CHECKING:
+    from scripts.elle_feel.models import HrvPoint
 
 
 def _open_connection(db_path: str) -> sqlite3.Connection:
@@ -299,7 +303,11 @@ def extraction_efficiency(con: sqlite3.Connection) -> dict:
 # Main consolidation runner
 # ---------------------------------------------------------------------------
 
-def run_consolidation(db_path: str) -> dict:
+def run_consolidation(
+    db_path: str,
+    hrv_points: "Sequence[HrvPoint] | None" = None,
+    self_entity_id: int | None = None,
+) -> dict:
     """Run the full consolidation pipeline.
 
     Decay model: as of the Garden-style retrieval scoring shipped in PR #5,
@@ -312,7 +320,20 @@ def run_consolidation(db_path: str) -> dict:
 
     What remains here is dedup, stale-question closing, approved merges,
     co-occurrence candidates, knowledge-gap auto-questions (with safety gates),
-    and observability metrics.
+    observability metrics, and (optionally) two care-message emission paths —
+    HRV trend and valence trend — that enqueue gentle Elle-side check-ins into
+    `open_questions` when signals warrant.
+
+    Optional params:
+      hrv_points: list of daily HRV readings. If None (default), the HRV
+                  care-message path is skipped entirely. Opt-in until Nik
+                  connects real Apple Health data on VDS. Kept optional so
+                  existing tests and CLI callers remain source-compatible.
+      self_entity_id: if provided, care messages are enqueued with that
+                      subject_entity_id. If None (default), the row is
+                      enqueued with NULL subject — the question is still
+                      addressable by its text and the VDS worker can route
+                      it directly to Nik.
     """
     con = _open_connection(db_path)
 
@@ -337,12 +358,52 @@ def run_consolidation(db_path: str) -> dict:
         trend = valence_trend(con)
         efficiency = extraction_efficiency(con)
 
-        # Mutating operations in a single transaction
+        # Care-message emission (opt-in; defaults skip both paths).
+        hrv_result: dict = {"enqueued": False, "signal_kind": "skipped",
+                            "tone": None, "question_id": None}
+        valence_result: dict = {"enqueued": False, "reason": "skipped",
+                                "question_id": None}
+
+        # Mutating operations in a single transaction — anything that
+        # writes goes in here so either everything commits or nothing does.
         con.execute("BEGIN IMMEDIATE")
         try:
             closed = close_stale_questions(con)
             merges = process_approved_merges(con)
             questions_added = auto_populate_questions(con, gaps)
+
+            # HRV care-message path: only if caller supplied points.
+            if hrv_points is not None:
+                # Import inside the function so running consolidation
+                # without the elle_feel package importable (edge case)
+                # doesn't blow up at module-load time.
+                from scripts.elle_feel.integration import check_and_enqueue
+                hrv_result = check_and_enqueue(
+                    con, list(hrv_points), self_entity_id=self_entity_id
+                )
+
+            # Valence care-message path: always-on, but gated on signal
+            # quality. Declining trend + >=7 days of data => one message.
+            if trend.get("trend") == "declining" and int(trend.get("data_points", 0)) >= 7:
+                from scripts.elle_feel.valence_message import generate_valence_message
+                text = generate_valence_message(trend)
+                if text is not None:
+                    now = datetime.now(timezone.utc)
+                    now_iso = now.isoformat()
+                    ttl_iso = (now + timedelta(days=3)).isoformat()
+                    cur = con.execute(
+                        "INSERT OR IGNORE INTO open_questions "
+                        "(subject_entity_id, question_text, asked_at, ttl_expires_at, state) "
+                        "VALUES (?, ?, ?, ?, 'open')",
+                        (self_entity_id, text, now_iso, ttl_iso),
+                    )
+                    if cur.rowcount > 0:
+                        valence_result = {"enqueued": True, "reason": "declining_trend",
+                                          "question_id": cur.lastrowid}
+                    else:
+                        valence_result = {"enqueued": False, "reason": "dedup_hit",
+                                          "question_id": None}
+
             _set_metadata(con, "last_consolidation_ts", datetime.now(timezone.utc).isoformat())
             con.execute("COMMIT")
         except Exception:
@@ -362,6 +423,8 @@ def run_consolidation(db_path: str) -> dict:
         "questions_auto_added": questions_added,
         "valence_trend": trend,
         "extraction_efficiency": efficiency,
+        "hrv_care": hrv_result,
+        "valence_care": valence_result,
     }
 
 
