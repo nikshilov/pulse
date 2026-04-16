@@ -117,3 +117,151 @@ def test_run_consolidation_end_to_end(tmp_path):
     assert "duplicate_candidates" in report
     assert "stale_questions_closed" in report
     assert "merges_executed" in report
+
+
+# ---------------------------------------------------------------------------
+# Task 3: Skip-guard
+# ---------------------------------------------------------------------------
+
+def test_skip_guard_skips_when_no_changes(tmp_path):
+    from pulse_consolidate import run_consolidation
+    _, db_path = _fresh_db(tmp_path)
+    report1 = run_consolidation(db_path)
+    assert report1.get("skipped") is not True
+    report2 = run_consolidation(db_path)
+    assert report2["skipped"] is True
+    assert "reason" in report2
+
+
+def test_skip_guard_runs_when_new_entities(tmp_path):
+    from pulse_consolidate import run_consolidation
+    con, db_path = _fresh_db(tmp_path)
+    run_consolidation(db_path)
+    now = "2099-01-01T00:00:00Z"
+    con.execute("INSERT INTO entities (canonical_name, kind, first_seen, last_seen) VALUES ('NewPerson','person',?,?)", (now, now))
+    con.commit()
+    report2 = run_consolidation(db_path)
+    assert report2.get("skipped") is not True
+
+
+# ---------------------------------------------------------------------------
+# Task 4: Co-occurrence Detection
+# ---------------------------------------------------------------------------
+
+def test_find_cooccurrence_candidates(tmp_path):
+    from pulse_consolidate import find_cooccurrence_candidates
+    con, _ = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen) VALUES (1,'Anna','person',?,?)", (now, now))
+    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen) VALUES (2,'Nik','person',?,?)", (now, now))
+    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen) VALUES (3,'Solo','person',?,?)", (now, now))
+    for i in range(1, 4):
+        con.execute("INSERT INTO events (id, title, ts) VALUES (?,?,?)", (i, f"event_{i}", now))
+        con.execute("INSERT INTO event_entities (event_id, entity_id) VALUES (?,?)", (i, 1))
+        con.execute("INSERT INTO event_entities (event_id, entity_id) VALUES (?,?)", (i, 2))
+    con.execute("INSERT INTO event_entities (event_id, entity_id) VALUES (1,3)")
+    candidates = find_cooccurrence_candidates(con)
+    pairs = [(c["entity_a_id"], c["entity_b_id"]) for c in candidates]
+    assert (1, 2) in pairs
+    assert all(c["co_count"] >= 3 for c in candidates)
+
+
+# ---------------------------------------------------------------------------
+# Task 5: Knowledge Gaps + Auto-populate open_questions
+# ---------------------------------------------------------------------------
+
+def test_detect_knowledge_gaps(tmp_path):
+    from pulse_consolidate import detect_knowledge_gaps
+    con, _ = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen) VALUES (1,'MysteryPerson','person',?,?)", (now, now))
+    for i in range(1, 6):
+        con.execute("INSERT INTO events (id, title, ts) VALUES (?,?,?)", (i, f"event_{i}", now))
+        con.execute("INSERT INTO event_entities (event_id, entity_id) VALUES (?,1)", (i,))
+    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen) VALUES (2,'Rare','person',?,?)", (now, now))
+    con.execute("INSERT INTO events (id, title, ts) VALUES (6,'ev6',?)", (now,))
+    con.execute("INSERT INTO event_entities (event_id, entity_id) VALUES (6,2)")
+    gaps = detect_knowledge_gaps(con)
+    gap_ids = [g["entity_id"] for g in gaps]
+    assert 1 in gap_ids
+    assert 2 not in gap_ids
+
+
+def test_auto_populate_questions(tmp_path):
+    from pulse_consolidate import detect_knowledge_gaps, auto_populate_questions
+    con, _ = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen) VALUES (1,'Gap','person',?,?)", (now, now))
+    for i in range(1, 5):
+        con.execute("INSERT INTO events (id, title, ts) VALUES (?,?,?)", (i, f"e{i}", now))
+        con.execute("INSERT INTO event_entities (event_id, entity_id) VALUES (?,1)", (i,))
+    gaps = detect_knowledge_gaps(con)
+    added = auto_populate_questions(con, gaps)
+    assert added >= 1
+    questions = con.execute("SELECT question_text, state FROM open_questions WHERE subject_entity_id=1").fetchall()
+    assert len(questions) >= 1
+    assert questions[0][1] == "open"
+
+
+# ---------------------------------------------------------------------------
+# Task 6: Salience Decay
+# ---------------------------------------------------------------------------
+
+def test_decay_salience_reduces_stale_entities(tmp_path):
+    from pulse_consolidate import decay_salience
+    con, _ = _fresh_db(tmp_path)
+    old_date = "2020-01-01T00:00:00Z"
+    recent_date = "2026-04-16T00:00:00Z"
+    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen, salience_score) VALUES (1,'OldFriend','person',?,?,0.8)", (old_date, old_date))
+    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen, salience_score) VALUES (2,'NewFriend','person',?,?,0.8)", (recent_date, recent_date))
+    updated = decay_salience(con)
+    assert updated >= 1
+    old_salience = con.execute("SELECT salience_score FROM entities WHERE id=1").fetchone()[0]
+    new_salience = con.execute("SELECT salience_score FROM entities WHERE id=2").fetchone()[0]
+    assert old_salience < 0.8
+    assert old_salience >= 0.05
+    assert new_salience == 0.8
+
+
+def test_decay_salience_respects_kind_rates(tmp_path):
+    from pulse_consolidate import decay_salience
+    con, _ = _fresh_db(tmp_path)
+    old_date = "2025-01-01T00:00:00Z"
+    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen, salience_score) VALUES (1,'PersonX','person',?,?,0.8)", (old_date, old_date))
+    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen, salience_score) VALUES (2,'ConceptY','concept',?,?,0.8)", (old_date, old_date))
+    decay_salience(con)
+    person_s = con.execute("SELECT salience_score FROM entities WHERE id=1").fetchone()[0]
+    concept_s = con.execute("SELECT salience_score FROM entities WHERE id=2").fetchone()[0]
+    assert concept_s < person_s
+
+
+# ---------------------------------------------------------------------------
+# Task 7: Observability Metrics
+# ---------------------------------------------------------------------------
+
+def test_valence_trend_stable(tmp_path):
+    from pulse_consolidate import valence_trend
+    con, _ = _fresh_db(tmp_path)
+    for i in range(10):
+        day = f"2026-04-{i+1:02d}T12:00:00Z"
+        con.execute("INSERT INTO events (title, sentiment, ts) VALUES (?,?,?)", (f"e{i}", 0.5, day))
+    result = valence_trend(con, days=30)
+    assert result["trend"] in ("stable", "no_data", "insufficient")
+    assert result["data_points"] >= 2
+
+
+def test_extraction_efficiency(tmp_path):
+    from pulse_consolidate import extraction_efficiency
+    con, _ = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    for i in range(1, 6):
+        con.execute("INSERT INTO entities (canonical_name, kind, first_seen, last_seen) VALUES (?,?,?,?)", (f"E{i}", "person", now, now))
+    con.execute(
+        "INSERT INTO extraction_jobs (observation_ids, state, created_at, updated_at) VALUES ('[1]','done',?,?)",
+        (now, now),
+    )
+    con.execute("INSERT INTO extraction_metrics (job_id, model, input_tokens, output_tokens) VALUES (1,'opus',5000,1000)")
+    result = extraction_efficiency(con)
+    assert result["total_entities"] == 5
+    assert result["total_tokens"] == 6000
+    assert result["entities_per_1k_tokens"] > 0
