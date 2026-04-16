@@ -7,6 +7,8 @@ import pytest
 from unittest.mock import patch
 import pulse_extract
 
+MOCK_USAGE = {"input_tokens": 0, "output_tokens": 0, "model": "test"}
+
 
 @pytest.fixture
 def seeded_db(tmp_path):
@@ -32,14 +34,14 @@ def seeded_db(tmp_path):
 def test_extract_loop_processes_pending(seeded_db, monkeypatch):
     from unittest.mock import MagicMock
 
-    fake_triage = MagicMock(return_value=[{"verdict": "extract", "reason": "family mention"}])
-    fake_extract = MagicMock(return_value={
+    fake_triage = MagicMock(return_value=([{"verdict": "extract", "reason": "family mention"}], MOCK_USAGE))
+    fake_extract = MagicMock(return_value=({
         "entities": [{"canonical_name": "Anna", "kind": "person", "aliases": ["Аня"], "salience": 0.9, "emotional_weight": 0.7}],
         "relations": [],
         "events": [],
         "facts": [],
         "merge_candidates": [],
-    })
+    }, MOCK_USAGE))
 
     monkeypatch.setattr(pulse_extract, "call_sonnet_triage", fake_triage)
     monkeypatch.setattr(pulse_extract, "call_opus_extract", fake_extract)
@@ -89,8 +91,8 @@ def test_relations_and_facts_persisted(seeded_db, monkeypatch):
     import sqlite3
     import pulse_extract
 
-    fake_triage = MagicMock(return_value=[{"verdict": "extract", "reason": "family"}])
-    fake_extract = MagicMock(return_value={
+    fake_triage = MagicMock(return_value=([{"verdict": "extract", "reason": "family"}], MOCK_USAGE))
+    fake_extract = MagicMock(return_value=({
         "entities": [
             {"canonical_name": "Anna", "kind": "person", "aliases": ["Аня"], "salience": 0.9, "emotional_weight": 0.8},
             {"canonical_name": "Fedya", "kind": "person", "aliases": ["Федя"], "salience": 0.5, "emotional_weight": 0.3},
@@ -104,7 +106,7 @@ def test_relations_and_facts_persisted(seeded_db, monkeypatch):
         ],
         "events": [],
         "merge_candidates": [],
-    })
+    }, MOCK_USAGE))
     monkeypatch.setattr(pulse_extract, "call_sonnet_triage", fake_triage)
     monkeypatch.setattr(pulse_extract, "call_opus_extract", fake_extract)
 
@@ -133,18 +135,31 @@ def test_call_sonnet_triage_uses_anthropic_client(monkeypatch):
     import pulse_extract
     from unittest.mock import MagicMock
 
+    fake_block = MagicMock()
+    fake_block.type = "tool_use"
+    fake_block.name = "triage_observations"
+    fake_block.input = {
+        "verdicts": [
+            {"index": 1, "verdict": "extract", "reason": "real"},
+            {"index": 2, "verdict": "skip", "reason": "trivial"},
+        ]
+    }
+
     fake_message = MagicMock()
-    fake_message.content = [MagicMock(text="1. extract — real\n2. skip — trivial")]
+    fake_message.content = [fake_block]
+    fake_message.usage.input_tokens = 10
+    fake_message.usage.output_tokens = 5
 
     fake_client = MagicMock()
     fake_client.messages.create.return_value = fake_message
 
     monkeypatch.setattr(pulse_extract, "_anthropic_client", lambda: fake_client)
 
-    out = pulse_extract.call_sonnet_triage("some prompt", expected_count=2)
+    out, usage = pulse_extract.call_sonnet_triage("some prompt", expected_count=2)
     assert len(out) == 2
     assert out[0]["verdict"] == "extract"
     assert out[1]["verdict"] == "skip"
+    assert usage["model"] == "claude-sonnet-4-6"
 
     # model id sanity
     args, kwargs = fake_client.messages.create.call_args
@@ -155,16 +170,27 @@ def test_call_opus_extract_uses_anthropic_client(monkeypatch):
     import pulse_extract
     from unittest.mock import MagicMock
 
+    fake_block = MagicMock()
+    fake_block.type = "tool_use"
+    fake_block.name = "save_extraction"
+    fake_block.input = {
+        "entities": [{"canonical_name": "X", "kind": "person", "aliases": [], "salience": 0.5, "emotional_weight": 0.5}],
+        "relations": [], "events": [], "facts": [], "merge_candidates": [],
+    }
+
     fake_message = MagicMock()
-    fake_message.content = [MagicMock(text='{"entities":[{"canonical_name":"X","kind":"person","aliases":[],"salience":0.5,"emotional_weight":0.5}],"relations":[],"events":[],"facts":[],"merge_candidates":[]}')]
+    fake_message.content = [fake_block]
+    fake_message.usage.input_tokens = 20
+    fake_message.usage.output_tokens = 10
 
     fake_client = MagicMock()
     fake_client.messages.create.return_value = fake_message
 
     monkeypatch.setattr(pulse_extract, "_anthropic_client", lambda: fake_client)
 
-    out = pulse_extract.call_opus_extract("prompt")
+    out, usage = pulse_extract.call_opus_extract("prompt")
     assert out["entities"][0]["canonical_name"] == "X"
+    assert usage["model"] == "claude-opus-4-6"
 
     args, kwargs = fake_client.messages.create.call_args
     assert kwargs["model"] == "claude-opus-4-6"
@@ -189,8 +215,8 @@ def test_unknown_entity_reference_is_skipped(seeded_db, monkeypatch, capsys):
     import sqlite3
     import pulse_extract
 
-    fake_triage = MagicMock(return_value=[{"verdict": "extract", "reason": "family"}])
-    fake_extract = MagicMock(return_value={
+    fake_triage = MagicMock(return_value=([{"verdict": "extract", "reason": "family"}], MOCK_USAGE))
+    fake_extract = MagicMock(return_value=({
         "entities": [
             {"canonical_name": "Anna", "kind": "person", "aliases": [], "salience": 0.9, "emotional_weight": 0.8},
         ],
@@ -202,7 +228,7 @@ def test_unknown_entity_reference_is_skipped(seeded_db, monkeypatch, capsys):
         ],
         "events": [],
         "merge_candidates": [],
-    })
+    }, MOCK_USAGE))
     monkeypatch.setattr(pulse_extract, "call_sonnet_triage", fake_triage)
     monkeypatch.setattr(pulse_extract, "call_opus_extract", fake_extract)
 
