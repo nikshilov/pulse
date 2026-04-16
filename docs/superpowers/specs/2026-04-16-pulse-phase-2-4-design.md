@@ -289,9 +289,26 @@ CREATE INDEX idx_entities_kind ON entities(kind);
 -- Relation context
 ALTER TABLE relations ADD COLUMN context TEXT;
 
--- Fact verification
+-- Fact verification + provenance
 ALTER TABLE facts ADD COLUMN verified INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE facts ADD COLUMN verified_by TEXT;
+ALTER TABLE facts ADD COLUMN source_obs_id INTEGER REFERENCES observations(id);
+ALTER TABLE facts ADD COLUMN extractor_version TEXT NOT NULL DEFAULT 'v2';
+
+-- Entity provenance
+ALTER TABLE entities ADD COLUMN extractor_version TEXT NOT NULL DEFAULT 'v2';
+
+-- Extraction cost/performance tracking (Appendix A.5)
+CREATE TABLE extraction_metrics (
+    id           INTEGER PRIMARY KEY,
+    job_id       INTEGER NOT NULL REFERENCES extraction_jobs(id),
+    model        TEXT NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cost_usd     REAL,
+    latency_ms   INTEGER,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
 ```
 
 **New entity kinds (4 additions):**
@@ -478,6 +495,9 @@ CREATE VIRTUAL TABLE event_vec USING vec0(
     embedding float[1536]
 );
 
+-- Soft-delete for merged entities (Appendix A.3)
+ALTER TABLE entities ADD COLUMN merged_into INTEGER REFERENCES entities(id);
+
 CREATE TABLE embedding_metadata (
     subject_kind TEXT NOT NULL CHECK(subject_kind IN ('entity','event')),
     subject_id   INTEGER NOT NULL,
@@ -592,12 +612,12 @@ Basic CLI + Telegram flow (no web UI yet):
 
 ```python
 def execute_merge(con, from_entity_id: int, to_entity_id: int) -> dict:
-    """Merge from_entity into to_entity.
+    """Merge from_entity into to_entity (soft-delete pattern, see Appendix A.3).
     
     - Repoint all relations, facts, evidence, event_entities
-    - Merge aliases (union)
+    - Merge aliases (union) + add from_entity.canonical_name as alias
     - Update salience (max)
-    - Delete from_entity
+    - Set from_entity.merged_into = to_entity_id (NOT deleted — serves as redirect)
     - Mark proposal as approved
     - Queue to_entity for re-embedding
     """
@@ -776,3 +796,71 @@ mcp_graph_server.py    graph_viewer.py         TG digest flow
 ### Immediate Next Step
 
 **Phase 2a (tool-use schema)** — unblocks everything. 4-5 tasks, 1 session. After this, we can run scale smoke again and expect >80% successful writes instead of 0%.
+
+---
+
+## Appendix: Architectural Notes (o3 Review)
+
+Senior architect review surfaced these cross-cutting concerns:
+
+### A.1 Provenance Tracking
+
+Every extracted item should trace back to its source:
+- `facts` already have `confidence` but need `source_obs_id` (which observation produced this fact) and `extractor_version` (prompt/schema version that extracted it)
+- `entities` have `scorer_version` but should also have `extractor_version`
+- **Action (Phase 2b):** Add `source_obs_id INTEGER REFERENCES observations(id)` to `facts` and `extractor_version TEXT DEFAULT 'v2'` to both `entities` and `facts` in migration 007
+- This enables rollback ("re-extract all items from extractor v2 that scored below 0.5")
+
+### A.2 Hallucination → Verified Truth Loop Prevention
+
+Risk: Opus hallucinates a fact → consolidation merges it with real entity (looks "popular") → user rubber-stamps → downstream acts on it.
+
+Mitigations:
+- **Phase 2:** Every fact must link to `source_obs_id` — the raw text is always retrievable via the `evidence` table (obs_id → observation → raw text)
+- **Phase 4 (web viewer):** Show raw source snippet alongside fact text in verification UI — user sees context, not just the claim
+- **Phase 4 (HITL):** High-salience entities (>0.7) require explicit verification before their facts affect retrieval ranking
+
+### A.3 Merge Safeguards (Phase 3c)
+
+Current `execute_merge` deletes `from_entity`. Risks: information loss, broken external references.
+
+**Change:** Soft-delete → alias pattern:
+1. `from_entity` gets `merged_into INTEGER REFERENCES entities(id)` (new column in migration 008)
+2. `from_entity.canonical_name` added to `entity_aliases` for `to_entity`
+3. All relations/facts/evidence repointed
+4. `from_entity` row kept (not deleted) with `merged_into` set — serves as redirect
+5. Retrieval resolves `merged_into` transparently
+
+### A.4 sqlite-vec Scale Limits
+
+o3 estimates: practical upper bound ~1M vectors / ~2GB before ANN search exceeds 200ms. For Pulse:
+- **10K entities** (~60MB index) — no problem for years
+- **100K entities** (~600MB) — still fine
+- **Migration path:** If scale exceeds SQLite limits, DAO layer in `retrieval.py` makes the swap to pgvector mechanical (same SQL semantics). No need to pre-build — just keep the abstraction clean.
+
+### A.5 Observability & Cost Governance
+
+Currently absent. Add lightweight tracking:
+
+**Phase 2 (in migration 007):**
+```sql
+CREATE TABLE extraction_metrics (
+    id           INTEGER PRIMARY KEY,
+    job_id       INTEGER NOT NULL REFERENCES extraction_jobs(id),
+    model        TEXT NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cost_usd     REAL,
+    latency_ms   INTEGER,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+```
+
+This answers: "how much did extraction cost this week?", "which jobs are slowest?", "is Opus output quality correlated with token count?"
+
+### A.6 Graceful Degradation
+
+`tool_choice={"type":"tool","name":"save_extraction"}` should guarantee tool call, but handle edge cases:
+- API error / rate limit → retry with exponential backoff (3 attempts, 2s/4s/8s)
+- Opus returns tool call but with malformed input → catch validation error in `_apply_extraction`, log to `failed_items` (existing pattern)
+- Anthropic API outage → job stays `pending`, next `run_once` retries
