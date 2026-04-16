@@ -5,6 +5,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pulse_extract  # noqa: E402
@@ -18,6 +20,15 @@ def _apply_migrations(db_path: Path) -> None:
         con.executescript(mig.read_text())
     con.commit()
     con.close()
+
+
+def _fresh_db(tmp_path: Path) -> sqlite3.Connection:
+    """Create a fresh DB with all migrations applied; return an open connection."""
+    db = tmp_path / "test.db"
+    _apply_migrations(db)
+    con = sqlite3.connect(db)
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
 
 
 def _index_exists(con: sqlite3.Connection, name: str) -> bool:
@@ -693,3 +704,81 @@ def test_keyerror_in_entity_caught_by_savepoint(tmp_path):
         f"failed_item reason must include KeyError (got {bad[0]['reason']!r})"
     )
     assert bad[0]["detail"]["index"] == 1
+
+
+# ---------- Layer 5: migration 007 schema ----------
+
+def test_migration_007_entities_accepts_new_kinds(tmp_path):
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    new_kinds = ["product", "community", "skill", "concept"]
+    for kind in new_kinds:
+        con.execute(
+            "INSERT INTO entities (canonical_name, kind, first_seen, last_seen) VALUES (?,?,?,?)",
+            (f"test_{kind}", kind, now, now),
+        )
+    rows = con.execute("SELECT kind FROM entities ORDER BY kind").fetchall()
+    assert set(r[0] for r in rows) == set(new_kinds)
+
+
+def test_migration_007_entities_rejects_invalid_kind(tmp_path):
+    con = _fresh_db(tmp_path)
+    import sqlite3 as _s
+    with pytest.raises(_s.IntegrityError):
+        con.execute(
+            "INSERT INTO entities (canonical_name, kind, first_seen, last_seen) VALUES (?,?,?,?)",
+            ("bad", "invalid_kind", "2026-01-01", "2026-01-01"),
+        )
+
+
+def test_migration_007_entities_has_extractor_version(tmp_path):
+    con = _fresh_db(tmp_path)
+    con.execute(
+        "INSERT INTO entities (canonical_name, kind, first_seen, last_seen, extractor_version) VALUES (?,?,?,?,?)",
+        ("Nik", "person", "2026-01-01", "2026-01-01", "v2"),
+    )
+    row = con.execute("SELECT extractor_version FROM entities WHERE canonical_name='Nik'").fetchone()
+    assert row[0] == "v2"
+
+
+def test_migration_007_relations_has_context(tmp_path):
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen) VALUES (1,'A','person',?,?)", (now, now))
+    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen) VALUES (2,'B','person',?,?)", (now, now))
+    con.execute(
+        "INSERT INTO relations (from_entity_id, to_entity_id, kind, strength, first_seen, last_seen, context) VALUES (1,2,'colleague',1.0,?,?,'through Cherry Peak')",
+        (now, now),
+    )
+    row = con.execute("SELECT context FROM relations WHERE from_entity_id=1").fetchone()
+    assert row[0] == "through Cherry Peak"
+
+
+def test_migration_007_facts_has_provenance(tmp_path):
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    con.execute("INSERT INTO entities (id, canonical_name, kind, first_seen, last_seen) VALUES (1,'A','person',?,?)", (now, now))
+    con.execute(
+        "INSERT INTO observations (id, source_kind, source_id, content_hash, version, scope, captured_at, observed_at, actors) VALUES (42,'tg','1','h',1,'shared',?,?,'[]')",
+        (now, now),
+    )
+    con.execute(
+        "INSERT INTO facts (entity_id, text, confidence, source_obs_id, extractor_version, verified, created_at) VALUES (1,'fact text',0.9,42,'v2',0,?)",
+        (now,),
+    )
+    row = con.execute("SELECT source_obs_id, extractor_version, verified FROM facts WHERE entity_id=1").fetchone()
+    assert row == (42, "v2", 0)
+
+
+def test_migration_007_extraction_metrics_table(tmp_path):
+    con = _fresh_db(tmp_path)
+    con.execute(
+        "INSERT INTO extraction_jobs (observation_ids, state, attempts, created_at, updated_at) VALUES ('[]','done',1,'2026-01-01','2026-01-01')"
+    )
+    job_id = con.execute("SELECT id FROM extraction_jobs").fetchone()[0]
+    con.execute(
+        "INSERT INTO extraction_metrics (job_id, model, input_tokens, output_tokens, cost_usd, latency_ms) VALUES (?,?,?,?,?,?)",
+        (job_id, "claude-opus-4-6", 1000, 500, 0.15, 3200),
+    )
+    row = con.execute("SELECT model, input_tokens, output_tokens FROM extraction_metrics WHERE job_id=?", (job_id,)).fetchone()
+    assert row == ("claude-opus-4-6", 1000, 500)
