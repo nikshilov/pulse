@@ -157,3 +157,87 @@ def test_retrieve_handles_zero_salience(tmp_path):
     result = retrieve_context(con, "ZeroScore")
     assert result["total_matched"] == 1
     assert result["matched_entities"][0]["salience_score"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Garden-style ranking: emotional_weight + anchor boost + kind-aware decay
+# ---------------------------------------------------------------------------
+
+def test_rank_emotional_weight_beats_equal_salience(tmp_path):
+    """Two persons with equal salience but different emotional_weight: high-emo ranks first."""
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    # Same name → message matches both; same salience → only emo differentiates
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight) "
+        "VALUES (1,'Shared','person',?,?,?,0.5,0.9)", (json.dumps(["Shared"]), now, now)
+    )
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight) "
+        "VALUES (2,'Other','person',?,?,?,0.5,0.0)", (json.dumps(["Shared"]), now, now)
+    )
+    result = retrieve_context(con, "Shared")
+    # Both matched by alias "Shared"; id=1 has emo=0.9 → higher score
+    assert result["matched_entities"][0]["id"] == 1
+
+
+def test_rank_emotional_weight_additive_not_multiplicative(tmp_path):
+    """Low-salience high-emo should beat high-salience zero-emo (additive model).
+
+    Without additive formula, a salience=0.9/emo=0 entity wins. With (salience+emo),
+    salience=0.3/emo=0.9 = 1.2 total, vs salience=0.9/emo=0 = 0.9.
+    """
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight) "
+        "VALUES (1,'Wound','concept',?,?,?,0.3,0.9)", (json.dumps(["Keyword"]), now, now)
+    )
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight) "
+        "VALUES (2,'Trivia','concept',?,?,?,0.9,0.0)", (json.dumps(["Keyword"]), now, now)
+    )
+    result = retrieve_context(con, "Keyword")
+    assert result["matched_entities"][0]["canonical_name"] == "Wound"
+
+
+def test_rank_anchor_boost_for_emotional_persons(tmp_path):
+    """Person with emo>0.6 gets 1.5× anchor boost over a project with same totals."""
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    # Person: (0.2+0.7)*recency*1.5 = 1.35*recency
+    # Project: (0.2+0.7)*recency*1.0 = 0.9*recency
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight) "
+        "VALUES (1,'PersonA','person',?,?,?,0.2,0.7)", (json.dumps(["target"]), now, now)
+    )
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight) "
+        "VALUES (2,'ProjectA','project',?,?,?,0.2,0.7)", (json.dumps(["target"]), now, now)
+    )
+    result = retrieve_context(con, "target")
+    assert result["matched_entities"][0]["canonical_name"] == "PersonA"
+
+
+def test_rank_kind_aware_decay_concept_fades_faster(tmp_path):
+    """Concept (λ=0.01) 100 days stale loses to person (λ=0.001) 100 days stale."""
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    stale = "2026-01-06T00:00:00Z"  # 100 days earlier
+    # Equal salience, equal emo, equal hop — only kind-decay separates them
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight) "
+        "VALUES (1,'StaleConcept','concept',?,?,?,0.5,0.3)", (json.dumps(["target"]), stale, stale)
+    )
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight) "
+        "VALUES (2,'StalePerson','person',?,?,?,0.5,0.3)", (json.dumps(["target"]), stale, stale)
+    )
+    # person λ=0.001 × 100 = 0.1 → e^-0.1 ≈ 0.905
+    # concept λ=0.01 × 100 = 1.0 → e^-1.0 ≈ 0.368
+    result = retrieve_context(con, "target")
+    assert result["matched_entities"][0]["canonical_name"] == "StalePerson"
