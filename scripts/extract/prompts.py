@@ -2,6 +2,16 @@
 
 With Phase 2 tool-use, the model output structure is enforced by tool schemas.
 These prompts provide semantic guidance — WHAT to extract, not HOW to format it.
+
+Prompt caching:
+- `build_triage_prompt_parts` returns (static_prefix, dynamic_suffix). The static
+  prefix contains TRIAGE_INSTRUCTIONS and is cacheable across calls via
+  `cache_control: {type: "ephemeral"}`. The dynamic suffix holds the specific
+  observation lines.
+- `build_extract_prompt_parts` returns (static_prefix, dynamic_suffix). Static =
+  EXTRACT_INSTRUCTIONS + tool-use framing (always the same). Dynamic =
+  existing_entities block + the specific observation body (these change per call
+  so are kept in the uncached suffix).
 """
 
 
@@ -19,8 +29,26 @@ Only skip truly empty observations.
 """
 
 
+# Static framing that is identical across every triage call. Separate from
+# TRIAGE_INSTRUCTIONS so the static-prefix cache tier can grow without changing
+# the documented instruction text.
+TRIAGE_STATIC_PREFIX = TRIAGE_INSTRUCTIONS + "\nObservations:\n"
+
+
 def build_triage_prompt(observations) -> str:
-    lines = [TRIAGE_INSTRUCTIONS, "", "Observations:"]
+    """Legacy single-string builder (kept for backward compatibility)."""
+    static, dynamic = build_triage_prompt_parts(observations)
+    return static + dynamic
+
+
+def build_triage_prompt_parts(observations) -> tuple[str, str]:
+    """Return (static_prefix, dynamic_suffix) for prompt-cache use.
+
+    static_prefix — invariant instructions + framing; marked ephemeral in the
+    Anthropic call so repeated invocations share a cache entry.
+    dynamic_suffix — the observation lines (change every call).
+    """
+    lines: list[str] = []
     for i, obs in enumerate(observations, 1):
         actors = ", ".join(
             f"{a.get('kind', '?')}:{a.get('id', '?')}"
@@ -30,7 +58,7 @@ def build_triage_prompt(observations) -> str:
         lines.append(f"{i}. [{obs.get('source_kind')} | {actors}] {text}")
     lines.append("")
     lines.append("Classify each observation now.")
-    return "\n".join(lines)
+    return TRIAGE_STATIC_PREFIX, "\n".join(lines)
 
 
 EXTRACT_INSTRUCTIONS = """You are the knowledge-graph extractor for a personal AI assistant.
@@ -55,9 +83,32 @@ If a name matches an existing entity alias, prefer the existing entity.
 """
 
 
+# Static framing for the Opus extract call. existing_entities is NOT here — it
+# varies per call (top-K by observation relevance) so it lives in the dynamic
+# suffix. Caching existing_entities would require a second cache tier and is
+# premature optimization at current scale (see task spec, option (a)).
+EXTRACT_STATIC_PREFIX = (
+    EXTRACT_INSTRUCTIONS
+    + "\nCall the save_extraction tool to record entities/relations/events/facts/merge_candidates.\n"
+)
+
+
 def build_extract_prompt(observation: dict, graph_context: dict) -> str:
+    """Legacy single-string builder (kept for backward compatibility)."""
+    static, dynamic = build_extract_prompt_parts(observation, graph_context)
+    return static + dynamic
+
+
+def build_extract_prompt_parts(
+    observation: dict, graph_context: dict
+) -> tuple[str, str]:
+    """Return (static_prefix, dynamic_suffix) for the Opus extract prompt.
+
+    static_prefix — EXTRACT_INSTRUCTIONS + tool-use framing (invariant, cacheable).
+    dynamic_suffix — existing_entities block + the observation body.
+    """
     existing = graph_context.get("existing_entities", [])
-    existing_lines = []
+    existing_lines: list[str] = []
     for e in existing:
         aliases = ", ".join(e.get("aliases") or [])
         existing_lines.append(
@@ -67,8 +118,7 @@ def build_extract_prompt(observation: dict, graph_context: dict) -> str:
     actors = ", ".join(
         f"{a.get('kind')}:{a.get('id')}" for a in observation.get("actors", [])
     )
-    return "\n".join([
-        EXTRACT_INSTRUCTIONS,
+    dynamic = "\n".join([
         "",
         "Existing entities in the graph:",
         "\n".join(existing_lines) if existing_lines else "  (none)",
@@ -76,3 +126,4 @@ def build_extract_prompt(observation: dict, graph_context: dict) -> str:
         f"Observation (source={observation.get('source_kind')}, actors={actors}):",
         observation.get("content_text", ""),
     ])
+    return EXTRACT_STATIC_PREFIX, dynamic

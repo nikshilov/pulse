@@ -37,11 +37,11 @@ def test_e2e_extraction_creates_graph(tmp_path, monkeypatch):
     fixtures = json.loads(FIXTURES.read_text())
     db = _seed(tmp_path)
 
-    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", lambda prompt, expected_count: (
+    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", lambda prompt, expected_count, **_kw: (
         [{"verdict": "extract", "reason": "mentions family"}, {"verdict": "skip", "reason": "trivial greeting"}],
         MOCK_USAGE,
     ))
-    monkeypatch.setattr(pulse_extract, "call_opus_extract", lambda prompt: (fixtures["extract_1"], MOCK_USAGE))
+    monkeypatch.setattr(pulse_extract, "call_opus_extract", lambda prompt, **_kw: (fixtures["extract_1"], MOCK_USAGE))
 
     rc = pulse_extract.run_once(str(db))
     assert rc == 0
@@ -66,11 +66,11 @@ def test_e2e_prints_apply_report(tmp_path, monkeypatch, capsys):
     fixtures = json.loads(FIXTURES.read_text())
     db = _seed(tmp_path)
 
-    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", lambda prompt, expected_count: (
+    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", lambda prompt, expected_count, **_kw: (
         [{"verdict": "extract", "reason": "mentions family"}, {"verdict": "skip", "reason": "trivial greeting"}],
         MOCK_USAGE,
     ))
-    monkeypatch.setattr(pulse_extract, "call_opus_extract", lambda prompt: (fixtures["extract_1"], MOCK_USAGE))
+    monkeypatch.setattr(pulse_extract, "call_opus_extract", lambda prompt, **_kw: (fixtures["extract_1"], MOCK_USAGE))
 
     rc = pulse_extract.run_once(str(db))
     assert rc == 0
