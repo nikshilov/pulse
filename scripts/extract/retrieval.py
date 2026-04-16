@@ -111,13 +111,25 @@ def _tokenize(message: str) -> list[str]:
 
 
 def _match_entities(con: sqlite3.Connection, tokens: list[str]) -> list[dict]:
+    """Match entities by canonical name or alias against tokens.
+
+    Safety: entities with `do_not_probe = 1` are skipped at the SEED level (not only
+    at BFS expansion). Judge 2/6 observation: the BFS neighbor gate alone is
+    half-done — a trauma entity that is directly named in the user's message would
+    otherwise land in top-k as a seed match. The correct rule is "never surface
+    a do_not_probe entity, period," so we gate here too.
+    """
     matched: dict[int, dict] = {}
     all_entities = con.execute(
-        "SELECT id, canonical_name, kind, aliases, salience_score, emotional_weight, last_seen FROM entities"
+        "SELECT id, canonical_name, kind, aliases, salience_score, emotional_weight, last_seen, do_not_probe, is_self FROM entities"
     ).fetchall()
 
     for row in all_entities:
-        eid, name, kind, aliases_json, salience, emo, last_seen = row
+        eid, name, kind, aliases_json, salience, emo, last_seen, do_not_probe, is_self = row
+        # Seed-level safety gate: user has explicitly opted this entity out of
+        # retrieval — respect that across the whole pipeline, even on direct match.
+        if do_not_probe:
+            continue
         try:
             aliases = json.loads(aliases_json) if aliases_json else []
         except (json.JSONDecodeError, TypeError):
@@ -135,6 +147,8 @@ def _match_entities(con: sqlite3.Connection, tokens: list[str]) -> list[dict]:
                         "salience_score": salience or 0.0,
                         "emotional_weight": emo or 0.0,
                         "last_seen": last_seen,
+                        "do_not_probe": int(do_not_probe or 0),
+                        "is_self": int(is_self or 0),
                     }
                 break
 
@@ -144,15 +158,21 @@ def _match_entities(con: sqlite3.Connection, tokens: list[str]) -> list[dict]:
 def _get_entity_full(
     con: sqlite3.Connection, entity_id: int
 ) -> dict | None:
-    """Fetch a single entity by ID for BFS-discovered entities."""
+    """Fetch a single entity by ID for BFS-discovered entities.
+
+    Returns None for `do_not_probe = 1` entities so they are never materialised
+    into the result set, even if reached by a caller that bypasses `_get_neighbor_ids`.
+    """
     row = con.execute(
-        "SELECT id, canonical_name, kind, aliases, salience_score, emotional_weight, last_seen "
+        "SELECT id, canonical_name, kind, aliases, salience_score, emotional_weight, last_seen, do_not_probe, is_self "
         "FROM entities WHERE id = ?",
         (entity_id,),
     ).fetchone()
     if row is None:
         return None
-    eid, name, kind, aliases_json, salience, emo, last_seen = row
+    eid, name, kind, aliases_json, salience, emo, last_seen, do_not_probe, is_self = row
+    if do_not_probe:
+        return None
     try:
         aliases = json.loads(aliases_json) if aliases_json else []
     except (json.JSONDecodeError, TypeError):
@@ -165,6 +185,8 @@ def _get_entity_full(
         "salience_score": salience or 0.0,
         "emotional_weight": emo or 0.0,
         "last_seen": last_seen,
+        "do_not_probe": int(do_not_probe or 0),
+        "is_self": int(is_self or 0),
     }
 
 
@@ -223,9 +245,20 @@ def _rank(entities: list[dict]) -> list[dict]:
 
     - recency       exp(-λ × days), λ = DECAY_RATES[kind] — retrieval-time decay
                     (non-destructive, unlike mutation-based decay in consolidation)
-    - anchor        1.5 if person with emotional_weight > 0.6 (core people boost)
+    - anchor        1.5 if person with emotional_weight > 0.6 (core people boost),
+                    but ALWAYS 1.0 for the self-entity (`is_self=1`). Judge 7
+                    observation: Nik's self-entity is frozen at seed values
+                    (salience=1.0, emo=0.9) and never decays. Without this strip
+                    the self wins every anchor contest — in the bench 11/15
+                    queries had Nik as top-1 regardless of subject. The self can
+                    still appear in results (direct aliases still match), it
+                    just no longer gets the ×1.5 anchor thumb on the scale.
     - emotional_weight is ADDITIVE so an emo-heavy low-salience memory is not
-      crushed by a salience-heavy but emotionally flat one
+      crushed by a salience-heavy but emotionally flat one. Emotional_weight
+      is used for RANKING only, never for gating — emotionally heavy entities
+      are exactly what the companion needs to surface when relevant. The only
+      gate is `do_not_probe=1`, applied upstream in `_match_entities` and
+      `_get_entity_full`.
     - hop_penalty   0.7 ^ hop (direct match > 1-hop > 2-hop)
     """
     now = datetime.now(timezone.utc)
@@ -243,7 +276,12 @@ def _rank(entities: list[dict]) -> list[dict]:
 
         salience = float(ent.get("salience_score") or 0.0)
         emo = float(ent.get("emotional_weight") or 0.0)
-        anchor = 1.5 if kind == "person" and emo > 0.6 else 1.0
+        is_self = int(ent.get("is_self") or 0)
+        if is_self:
+            # Self-entity: strip anchor boost. See Judge 7 in docstring above.
+            anchor = 1.0
+        else:
+            anchor = 1.5 if kind == "person" and emo > 0.6 else 1.0
 
         hop = ent.get("_hop", 0)
         hop_penalty = 0.7 ** hop
