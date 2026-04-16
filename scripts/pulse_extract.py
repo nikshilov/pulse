@@ -105,6 +105,7 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
         "obs_id": obs_id,
         "entities_written": 0,
         "events_written": 0,
+        "event_entities_written": 0,
         "relations_written": 0,
         "facts_written": 0,
         "failed_items": [],
@@ -161,16 +162,24 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
             for alias in (ent.get("aliases") or []):
                 name_to_id[alias] = entity_id
             report["entities_written"] += 1
-        except sqlite3.Error as ex:
+        except Exception as ex:
             con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
             con.execute(f"RELEASE SAVEPOINT {sp}")
-            _item_failure("entity", str(ex)[:200], {"index": idx, "canonical_name": ent.get("canonical_name", ""), "kind": ent.get("kind", "")})
+            _item_failure("entity", f"{type(ex).__name__}: {str(ex)[:200]}",
+                          {"index": idx, "canonical_name": ent.get("canonical_name", ""), "kind": ent.get("kind", "")})
 
     # --- events ---
     for idx, ev in enumerate(result.get("events", [])):
         involved = ev.get("entities_involved") or []
         if not involved:
             _item_failure("event", "orphan_event_no_entities_involved", {"title": ev.get("title", "")})
+            continue
+        resolved_entity_ids = [name_to_id[n] for n in involved if n in name_to_id]
+        if not resolved_entity_ids:
+            _item_failure(
+                "event", "all_entities_involved_unresolved",
+                {"index": idx, "title": ev.get("title", ""), "names": involved},
+            )
             continue
         sp = f"ev_{idx}"
         con.execute(f"SAVEPOINT {sp}")
@@ -180,16 +189,24 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
                 "INSERT INTO events (title, description, sentiment, emotional_weight, scorer_version, ts) VALUES (?,?,?,?,?,?)",
                 (ev.get("title", ""), ev.get("description", ""), s["sentiment"], s["emotional_weight"], s["scorer_version"], ev.get("ts", now)),
             )
+            event_id = cur.lastrowid
+            for ent_id in resolved_entity_ids:
+                con.execute(
+                    "INSERT OR IGNORE INTO event_entities (event_id, entity_id) VALUES (?, ?)",
+                    (event_id, ent_id),
+                )
+                report["event_entities_written"] += 1
             con.execute(
                 "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('event',?,?,?)",
-                (cur.lastrowid, obs_id, now),
+                (event_id, obs_id, now),
             )
             con.execute(f"RELEASE SAVEPOINT {sp}")
             report["events_written"] += 1
-        except sqlite3.Error as ex:
+        except Exception as ex:
             con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
             con.execute(f"RELEASE SAVEPOINT {sp}")
-            _item_failure("event", str(ex)[:200], {"index": idx, "title": ev.get("title", "")})
+            _item_failure("event", f"{type(ex).__name__}: {str(ex)[:200]}",
+                          {"index": idx, "title": ev.get("title", "")})
 
     # --- relations ---
     for idx, rel in enumerate(result.get("relations", [])):
@@ -202,7 +219,11 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
         con.execute(f"SAVEPOINT {sp}")
         try:
             cur = con.execute(
-                "INSERT INTO relations (from_entity_id, to_entity_id, kind, strength, first_seen, last_seen) VALUES (?,?,?,?,?,?)",
+                """INSERT INTO relations (from_entity_id, to_entity_id, kind, strength, first_seen, last_seen)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(from_entity_id, to_entity_id, kind) DO UPDATE SET
+                       strength  = strength + 1,
+                       last_seen = excluded.last_seen""",
                 (from_id, to_id, rel.get("kind", ""), float(rel.get("strength", 0.0)), now, now),
             )
             con.execute(
@@ -211,10 +232,11 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
             )
             con.execute(f"RELEASE SAVEPOINT {sp}")
             report["relations_written"] += 1
-        except sqlite3.Error as ex:
+        except Exception as ex:
             con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
             con.execute(f"RELEASE SAVEPOINT {sp}")
-            _item_failure("relation", str(ex)[:200], {"index": idx, "from": rel.get("from", ""), "to": rel.get("to", ""), "kind": rel.get("kind", "")})
+            _item_failure("relation", f"{type(ex).__name__}: {str(ex)[:200]}",
+                          {"index": idx, "from": rel.get("from", ""), "to": rel.get("to", ""), "kind": rel.get("kind", "")})
 
     # --- facts ---
     for idx, fact in enumerate(result.get("facts", [])):
@@ -227,19 +249,23 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
         try:
             scored = scorer.score_fact(fact)
             cur = con.execute(
-                "INSERT INTO facts (entity_id, text, confidence, scorer_version, created_at) VALUES (?,?,?,?,?)",
+                """INSERT INTO facts (entity_id, text, confidence, scorer_version, created_at)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(entity_id, text) DO NOTHING""",
                 (entity_id, fact.get("text", ""), scored["confidence"], scored["scorer_version"], now),
             )
-            con.execute(
-                "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('fact',?,?,?)",
-                (cur.lastrowid, obs_id, now),
-            )
+            if cur.rowcount == 1:
+                con.execute(
+                    "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('fact',?,?,?)",
+                    (cur.lastrowid, obs_id, now),
+                )
+                report["facts_written"] += 1
             con.execute(f"RELEASE SAVEPOINT {sp}")
-            report["facts_written"] += 1
-        except sqlite3.Error as ex:
+        except Exception as ex:
             con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
             con.execute(f"RELEASE SAVEPOINT {sp}")
-            _item_failure("fact", str(ex)[:200], {"index": idx, "entity": fact.get("entity", ""), "text": fact.get("text", "")[:80]})
+            _item_failure("fact", f"{type(ex).__name__}: {str(ex)[:200]}",
+                          {"index": idx, "entity": fact.get("entity", ""), "text": fact.get("text", "")[:80]})
 
     return report
 
@@ -274,6 +300,40 @@ def _set_job_state(con: sqlite3.Connection, job_id: int, state: str, *,
     con.execute("COMMIT")
 
 
+def _get_artifact(con: sqlite3.Connection, job_id: int, kind: str,
+                  obs_id: int | None) -> dict | None:
+    """Return the parsed payload_json for a (job_id, kind, obs_id) artifact, or None."""
+    if obs_id is None:
+        row = con.execute(
+            "SELECT payload_json FROM extraction_artifacts WHERE job_id=? AND kind=? AND obs_id IS NULL",
+            (job_id, kind),
+        ).fetchone()
+    else:
+        row = con.execute(
+            "SELECT payload_json FROM extraction_artifacts WHERE job_id=? AND kind=? AND obs_id=?",
+            (job_id, kind, obs_id),
+        ).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def _save_artifact(con: sqlite3.Connection, job_id: int, kind: str,
+                   obs_id: int | None, payload: dict, model: str) -> None:
+    """Persist a checkpoint artifact in its own committed tx.
+
+    First-write-wins: partial UNIQUE indices + INSERT OR IGNORE keep one
+    row per (job_id,kind,obs_id). Re-saving the same triple is a safe no-op
+    — the caller may be replaying after a crash where the artifact was
+    already committed but the downstream work (apply) hadn't finished.
+    """
+    con.execute("BEGIN IMMEDIATE")
+    con.execute(
+        "INSERT OR IGNORE INTO extraction_artifacts(job_id, kind, obs_id, payload_json, model) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (job_id, kind, obs_id, json.dumps(payload, ensure_ascii=False), model),
+    )
+    con.execute("COMMIT")
+
+
 def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
     con = _open_connection(db_path)
 
@@ -300,8 +360,11 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
                 continue
 
             try:
-                triage_prompt = prompts.build_triage_prompt(observations)
-                verdicts = call_sonnet_triage(triage_prompt, expected_count=len(observations))
+                verdicts = _get_artifact(con, job_id, "triage", None)
+                if verdicts is None:
+                    triage_prompt = prompts.build_triage_prompt(observations)
+                    verdicts = call_sonnet_triage(triage_prompt, expected_count=len(observations))
+                    _save_artifact(con, job_id, "triage", None, verdicts, TRIAGE_MODEL)
                 job_reports: list[dict] = []
 
                 if len(verdicts) != len(observations):
@@ -311,9 +374,12 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
                 for obs, v in zip(observations, verdicts):
                     if v["verdict"] != "extract":
                         continue
-                    graph_ctx = {"existing_entities": _load_existing_entities(con)}
-                    extract_prompt = prompts.build_extract_prompt(obs, graph_ctx)
-                    result = call_opus_extract(extract_prompt)
+                    result = _get_artifact(con, job_id, "extract", obs["id"])
+                    if result is None:
+                        graph_ctx = {"existing_entities": _load_existing_entities(con)}
+                        extract_prompt = prompts.build_extract_prompt(obs, graph_ctx)
+                        result = call_opus_extract(extract_prompt)
+                        _save_artifact(con, job_id, "extract", obs["id"], result, EXTRACT_MODEL)
 
                     con.execute("BEGIN IMMEDIATE")
                     try:
@@ -325,6 +391,7 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
                         job_reports.append({
                             "obs_id": obs["id"],
                             "entities_written": 0, "events_written": 0,
+                            "event_entities_written": 0,
                             "relations_written": 0, "facts_written": 0,
                             "failed_items": [{
                                 "item_kind": "whole_obs",
