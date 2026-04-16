@@ -91,3 +91,37 @@ def test_retrieve_method_is_keyword(tmp_path):
     _seed_graph(con)
     result = retrieve_context(con, "Anna")
     assert result["retrieval_method"] == "keyword"
+
+
+def test_retrieve_2hop_indirect_relation(tmp_path):
+    """Anna→Nik→Pulse: querying 'Anna' with depth=2 should find Pulse via Nik."""
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    _seed_graph(con)
+    result = retrieve_context(con, "Anna", depth=2)
+    names = [e["canonical_name"] for e in result["matched_entities"]]
+    assert "Anna" in names
+    assert "Pulse" in names  # found via Anna→Nik→Pulse (2 hops)
+
+
+def test_hop_penalty_ranking(tmp_path):
+    """Direct match should rank above 2-hop match."""
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    _seed_graph(con)
+    result = retrieve_context(con, "Anna", depth=2)
+    entities = result["matched_entities"]
+    anna_idx = next(i for i, e in enumerate(entities) if e["canonical_name"] == "Anna")
+    pulse_idx = next(i for i, e in enumerate(entities) if e["canonical_name"] == "Pulse")
+    assert anna_idx < pulse_idx  # Anna (direct) ranks above Pulse (2 hops away)
+
+
+def test_depth_0_returns_only_matched(tmp_path):
+    """depth=0 returns matched entity without expanding relations."""
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    _seed_graph(con)
+    result = retrieve_context(con, "Anna", depth=0)
+    names = [e["canonical_name"] for e in result["matched_entities"]]
+    assert "Anna" in names
+    assert "Nik" not in names  # no expansion
