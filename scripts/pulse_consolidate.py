@@ -3,7 +3,6 @@
 
 import argparse
 import json
-import math
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -201,13 +200,20 @@ def find_cooccurrence_candidates(con: sqlite3.Connection, min_cooccurrences: int
 # ---------------------------------------------------------------------------
 
 def detect_knowledge_gaps(con: sqlite3.Connection, min_mentions: int = 3, max_facts: int = 1) -> list[dict]:
+    """Find entities the system has seen often but barely understands.
+
+    Safety: rows with `do_not_probe = 1` are excluded at SQL level (structural opt-out,
+    user-controllable). `emotional_weight` is returned so `auto_populate_questions`
+    can apply a second, emotion-based gate before actually asking anything.
+    """
     rows = con.execute(
-        "SELECT e.id, e.canonical_name, e.kind, "
+        "SELECT e.id, e.canonical_name, e.kind, e.emotional_weight, "
         "       COUNT(DISTINCT ee.event_id) AS mention_count, "
         "       COUNT(DISTINCT f.id) AS fact_count "
         "FROM entities e "
         "LEFT JOIN event_entities ee ON ee.entity_id = e.id "
         "LEFT JOIN facts f ON f.entity_id = e.id "
+        "WHERE e.do_not_probe = 0 "
         "GROUP BY e.id "
         "HAVING mention_count > ? AND fact_count <= ? "
         "ORDER BY mention_count DESC LIMIT 10",
@@ -215,17 +221,27 @@ def detect_knowledge_gaps(con: sqlite3.Connection, min_mentions: int = 3, max_fa
     ).fetchall()
     return [
         {"entity_id": r[0], "canonical_name": r[1], "kind": r[2],
-         "mention_count": r[3], "fact_count": r[4]}
+         "emotional_weight": r[3] or 0.0,
+         "mention_count": r[4], "fact_count": r[5]}
         for r in rows
     ]
 
 
 def auto_populate_questions(con: sqlite3.Connection, gaps: list[dict], ttl_days: int = 30) -> int:
+    """Insert auto-generated "what's up with X?" open_questions for knowledge gaps.
+
+    Safety gate (in addition to the structural `do_not_probe` filter upstream):
+    any gap whose `emotional_weight > 0.6` is skipped silently. Elle does not
+    ask about emotionally heavy entities (wounds, ex-partners, trauma threads)
+    on her own — those require the human to open the door.
+    """
     now = datetime.now(timezone.utc)
     ttl = (now + timedelta(days=ttl_days)).isoformat()
     now_iso = now.isoformat()
     added = 0
     for gap in gaps:
+        if (gap.get("emotional_weight") or 0.0) > 0.6:
+            continue
         result = con.execute(
             "INSERT OR IGNORE INTO open_questions "
             "(subject_entity_id, question_text, asked_at, ttl_expires_at, state) "
@@ -235,42 +251,6 @@ def auto_populate_questions(con: sqlite3.Connection, gaps: list[dict], ttl_days:
         if result.rowcount > 0:
             added += 1
     return added
-
-
-# ---------------------------------------------------------------------------
-# Task 6: Salience Decay
-# ---------------------------------------------------------------------------
-
-DECAY_RATES = {
-    "person": 0.001,
-    "project": 0.005,
-    "place": 0.003,
-    "concept": 0.01,
-    "default": 0.005,
-}
-
-
-def decay_salience(con: sqlite3.Connection) -> int:
-    entities = con.execute(
-        "SELECT id, kind, salience_score, last_seen FROM entities WHERE salience_score > 0.05"
-    ).fetchall()
-    updated = 0
-    now = datetime.now(timezone.utc)
-    for eid, kind, salience, last_seen_str in entities:
-        try:
-            last = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00"))
-            days = (now - last).days
-        except (ValueError, AttributeError):
-            days = 30
-        if days < 1:
-            continue
-        lam = DECAY_RATES.get(kind, DECAY_RATES["default"])
-        new_salience = salience * math.exp(-lam * days)
-        new_salience = max(0.05, new_salience)
-        if abs(new_salience - salience) > 0.01:
-            con.execute("UPDATE entities SET salience_score = ? WHERE id = ?", (round(new_salience, 4), eid))
-            updated += 1
-    return updated
 
 
 # ---------------------------------------------------------------------------
@@ -320,22 +300,26 @@ def extraction_efficiency(con: sqlite3.Connection) -> dict:
 # ---------------------------------------------------------------------------
 
 def run_consolidation(db_path: str) -> dict:
+    """Run the full consolidation pipeline.
+
+    Decay model: as of the Garden-style retrieval scoring shipped in PR #5,
+    salience decay is *retrieval-time only* (see `scripts/extract/retrieval.py:_rank`,
+    where `recency = exp(-λ × days)` is applied on read). The previous
+    mutation-based `decay_salience` function — which irreversibly erosed
+    `salience_score` in the DB on every cron tick — has been removed. That design
+    was non-idempotent (double-firing cron = double erosion) and destroyed signal
+    that the retrieval pass can reconstruct non-destructively from `last_seen`.
+
+    What remains here is dedup, stale-question closing, approved merges,
+    co-occurrence candidates, knowledge-gap auto-questions (with safety gates),
+    and observability metrics.
+    """
     con = _open_connection(db_path)
 
     try:
-        # Task 6: salience decay always runs (time-dependent, not data-dependent)
-        con.execute("BEGIN IMMEDIATE")
-        try:
-            decay_count = decay_salience(con)
-            con.execute("COMMIT")
-        except Exception:
-            con.execute("ROLLBACK")
-            raise
-
         # Task 3: skip-guard
         skip = _should_skip(con)
         if skip:
-            skip["salience_decayed"] = decay_count
             _set_metadata(con, "last_consolidation_ts", datetime.now(timezone.utc).isoformat())
             return skip
 
@@ -376,7 +360,6 @@ def run_consolidation(db_path: str) -> dict:
         "implicit_relation_candidates": cooccurrences,
         "knowledge_gaps": len(gaps),
         "questions_auto_added": questions_added,
-        "salience_decayed": decay_count,
         "valence_trend": trend,
         "extraction_efficiency": efficiency,
     }
@@ -406,7 +389,6 @@ def main() -> int:
         print(f"  {irc['entity_a_name']} <-> {irc['entity_b_name']} (co-occurs {irc['co_count']}x)")
     print(f"Knowledge gaps: {report.get('knowledge_gaps', 0)}")
     print(f"Questions auto-added: {report.get('questions_auto_added', 0)}")
-    print(f"Salience decayed: {report.get('salience_decayed', 0)}")
     print(f"Stale questions closed: {report['stale_questions_closed']}")
     print(f"Merges executed: {report['merges_executed']}")
     vt = report.get("valence_trend", {})
