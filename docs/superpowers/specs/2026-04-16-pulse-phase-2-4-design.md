@@ -741,16 +741,27 @@ If approved: schema migration generated automatically (ALTER TABLE workaround fo
 ## Roadmap: Dependencies & Effort
 
 ```
-Phase 2a (blocker)     Phase 2b (enrich)      Phase 2c (retrieve)    Phase 2d (consolidate)
+Phase 2a ✅             Phase 2b ✅             Phase 2c ✅             Phase 2d ✅
 Tool-use schema        Migration 007          retrieval.py           consolidate.py
 tool_schemas.py        Rich kinds             keyword matching       Sonnet review
 pulse_extract.py mod   relation context       1-hop traversal        merge execution
 fixture updates        fact verified flag                            daily cron
      │                      │                       │                      │
-     └──── must complete ───┘                       │                      │
-           before 2b                                │                      │
-                                                    └──── can parallel ────┘
-                                                          with 2a/2b
+     └──── DONE ────────────┘                       └──── DONE ────────────┘
+
+Phase 2e (graph intelligence) ← NEW, from research evaluation 2026-04-16
+See: specs/2026-04-16-pulse-phase-2b-graph-intelligence.md
+
+  2e.1 Adaptive depth    2e.2 Consolidation     2e.3 Salience decay    2e.4 Observability
+  BFS retrieval          enrichment             exp(-λ*days)           valence trend
+  depth=1..3             co-occurrence          kind-dependent λ       extraction efficiency
+  hop penalty ranking    knowledge gaps         salience floor 0.05
+                         open_questions
+                         skip-guard
+       │                      │                       │                      │
+       └──── extend ──────────┘                       │                      │
+             retrieval.py                             └──── extend ──────────┘
+                                                            consolidate.py
 
 Phase 3a (embed)       Phase 3b (semantic)     Phase 3c (aliases+merge)
 Migration 008          Hybrid retrieval        entity_aliases table
@@ -759,7 +770,7 @@ pulse_embed.py         context ranking         pulse_merge.py
                        budget trimming
      │                      │                       │
      └──── depends on ──────┘                       │
-           Phase 2 complete                         └── can start with 3a
+           Phase 2e complete                        └── can start with 3a
                                                         (normalized aliases)
 
 Phase 4a (MCP)         Phase 4b (viewer)       Phase 4c (HITL)
@@ -770,22 +781,27 @@ mcp_graph_server.py    graph_viewer.py         TG digest flow
      └── depends on Phase 3 (retrieval works) ──────┘
 ```
 
+### Phase 2 Status: COMPLETE (2026-04-16)
+
+Validated with $10 scale smoke: 19/19 jobs done, 15 entities, 8 relations, 21 facts (vs 0 writes in Phase 1). PR #3 merged.
+
 ### Effort Estimates
 
-| Phase | Estimated tasks | Effort | Dependencies |
-|-------|----------------|--------|-------------|
-| **2a** Tool-use schema | 4-5 tasks | 1 session | None (blocker) |
-| **2b** Rich schema | 3-4 tasks | 1 session | 2a (needs working writes) |
-| **2c** Basic retrieval | 3-4 tasks | 1 session | 2a (needs data in graph) |
-| **2d** Consolidation | 3-4 tasks | 1 session | 2a, can parallel with 2c |
-| **3a** Embedding pipeline | 4-5 tasks | 1 session | Phase 2 complete |
-| **3b** Semantic retrieval | 3-4 tasks | 1 session | 3a |
-| **3c** Alias index + merge | 3-4 tasks | 1 session | 3a, can parallel with 3b |
-| **4a** MCP server | 3-4 tasks | 1 session | Phase 3 complete |
-| **4b** Web viewer | 5-6 tasks | 1-2 sessions | Phase 3 complete |
-| **4c** Human-in-the-loop | 4-5 tasks | 1 session | 4a + 4b |
+| Phase | Estimated tasks | Effort | Dependencies | Status |
+|-------|----------------|--------|-------------|--------|
+| **2a** Tool-use schema | 4-5 tasks | 1 session | None (blocker) | ✅ Done |
+| **2b** Rich schema | 3-4 tasks | 1 session | 2a | ✅ Done |
+| **2c** Basic retrieval | 3-4 tasks | 1 session | 2a | ✅ Done |
+| **2d** Consolidation | 3-4 tasks | 1 session | 2a | ✅ Done |
+| **2e** Graph intelligence | 4-5 tasks | 1 session | Phase 2 complete | **Next** |
+| **3a** Embedding pipeline | 4-5 tasks | 1 session | Phase 2e complete |  |
+| **3b** Semantic retrieval | 3-4 tasks | 1 session | 3a |  |
+| **3c** Alias index + merge | 3-4 tasks | 1 session | 3a, can parallel with 3b |  |
+| **4a** MCP server | 3-4 tasks | 1 session | Phase 3 complete |  |
+| **4b** Web viewer | 5-6 tasks | 1 session | Phase 3 complete |  |
+| **4c** Human-in-the-loop | 4-5 tasks | 1 session | 4a + 4b |  |
 
-**Total: ~35-45 tasks across 3 phases, ~8-12 sessions.**
+**Total: ~40-50 tasks across 4 phases, ~9-13 sessions.**
 
 ### Parallelization Opportunities
 
