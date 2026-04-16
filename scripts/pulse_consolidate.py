@@ -98,9 +98,15 @@ def process_approved_merges(con: sqlite3.Connection) -> int:
 
             merged_aliases: set[str] = set()
             if from_row and from_row[1]:
-                merged_aliases.update(json.loads(from_row[1]))
+                try:
+                    merged_aliases.update(json.loads(from_row[1]))
+                except (json.JSONDecodeError, TypeError):
+                    pass
             if to_row and to_row[0]:
-                merged_aliases.update(json.loads(to_row[0]))
+                try:
+                    merged_aliases.update(json.loads(to_row[0]))
+                except (json.JSONDecodeError, TypeError):
+                    pass
             if from_row:
                 merged_aliases.add(from_row[0])
 
@@ -316,37 +322,50 @@ def extraction_efficiency(con: sqlite3.Connection) -> dict:
 def run_consolidation(db_path: str) -> dict:
     con = _open_connection(db_path)
 
-    # Task 6: salience decay always runs (time-dependent, not data-dependent)
-    decay_count = decay_salience(con)
+    try:
+        # Task 6: salience decay always runs (time-dependent, not data-dependent)
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            decay_count = decay_salience(con)
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
 
-    # Task 3: skip-guard
-    skip = _should_skip(con)
-    if skip:
-        skip["salience_decayed"] = decay_count
-        _set_metadata(con, "last_consolidation_ts", datetime.now(timezone.utc).isoformat())
+        # Task 3: skip-guard
+        skip = _should_skip(con)
+        if skip:
+            skip["salience_decayed"] = decay_count
+            _set_metadata(con, "last_consolidation_ts", datetime.now(timezone.utc).isoformat())
+            return skip
+
+        # Read-only stats (no tx needed)
+        stats = entity_stats(con)
+        duplicates = find_duplicate_candidates(con)
+
+        # Task 4: co-occurrence (read-only)
+        cooccurrences = find_cooccurrence_candidates(con)
+
+        # Task 5: knowledge gaps (read-only)
+        gaps = detect_knowledge_gaps(con)
+
+        # Task 7: observability (read-only)
+        trend = valence_trend(con)
+        efficiency = extraction_efficiency(con)
+
+        # Mutating operations in a single transaction
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            closed = close_stale_questions(con)
+            merges = process_approved_merges(con)
+            questions_added = auto_populate_questions(con, gaps)
+            _set_metadata(con, "last_consolidation_ts", datetime.now(timezone.utc).isoformat())
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+    finally:
         con.close()
-        return skip
-
-    stats = entity_stats(con)
-    duplicates = find_duplicate_candidates(con)
-    closed = close_stale_questions(con)
-    merges = process_approved_merges(con)
-
-    # Task 4: co-occurrence
-    cooccurrences = find_cooccurrence_candidates(con)
-
-    # Task 5: knowledge gaps
-    gaps = detect_knowledge_gaps(con)
-    questions_added = auto_populate_questions(con, gaps)
-
-    # Task 7: observability
-    trend = valence_trend(con)
-    efficiency = extraction_efficiency(con)
-
-    # Task 3: record last run timestamp
-    _set_metadata(con, "last_consolidation_ts", datetime.now(timezone.utc).isoformat())
-
-    con.close()
 
     return {
         "stats": stats,

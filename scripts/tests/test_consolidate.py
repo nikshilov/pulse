@@ -265,3 +265,48 @@ def test_extraction_efficiency(tmp_path):
     assert result["total_entities"] == 5
     assert result["total_tokens"] == 6000
     assert result["entities_per_1k_tokens"] > 0
+
+
+def test_merge_survives_corrupted_aliases_json(tmp_path):
+    """process_approved_merges should not crash on invalid aliases JSON."""
+    from pulse_consolidate import process_approved_merges
+    con, _ = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score) "
+        "VALUES (1,'OldName','person','BROKEN JSON',?,?,0.5)", (now, now)
+    )
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score) "
+        "VALUES (2,'NewName','person','ALSO BROKEN',?,?,0.8)", (now, now)
+    )
+    con.execute(
+        "INSERT INTO entity_merge_proposals (from_entity_id, to_entity_id, confidence, evidence_md, state, proposed_at) "
+        "VALUES (1, 2, 0.95, 'test', 'approved', ?)", (now,)
+    )
+    merged = process_approved_merges(con)
+    assert merged == 1
+    remaining = con.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+    assert remaining == 1
+
+
+def test_run_consolidation_atomicity(tmp_path):
+    """run_consolidation wraps mutations in a transaction."""
+    from pulse_consolidate import run_consolidation
+    _, db_path = _fresh_db(tmp_path)
+    con = sqlite3.connect(db_path)
+    con.execute("PRAGMA foreign_keys = ON")
+    now = "2026-04-16T00:00:00Z"
+    con.execute(
+        "INSERT INTO entities (canonical_name, kind, first_seen, last_seen, salience_score) "
+        "VALUES ('TestEntity','person',?,?,0.8)", (now, now)
+    )
+    con.commit()
+    con.execute(
+        "INSERT INTO open_questions (subject_entity_id, question_text, asked_at, ttl_expires_at, state) "
+        "VALUES (1, 'stale?', ?, '2020-01-01T00:00:00Z', 'open')", (now,)
+    )
+    con.commit()
+    con.close()
+    report = run_consolidation(db_path)
+    assert report["stale_questions_closed"] == 1
