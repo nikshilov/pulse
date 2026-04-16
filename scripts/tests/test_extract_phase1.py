@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pulse_extract  # noqa: E402
 
+MOCK_USAGE = {"input_tokens": 0, "output_tokens": 0, "model": "test"}
+
 MIGRATIONS = Path(__file__).resolve().parents[2] / "internal" / "store" / "migrations"
 
 
@@ -520,7 +522,7 @@ def test_triage_artifact_saved_after_sonnet_call(tmp_path, monkeypatch):
     con.close()
 
     monkeypatch.setattr(pulse_extract, "call_sonnet_triage",
-                        lambda _p, expected_count: [{"verdict": "skip"} for _ in range(expected_count)])
+                        lambda _p, expected_count: ([{"verdict": "skip"} for _ in range(expected_count)], MOCK_USAGE))
 
     pulse_extract.run_once(str(db))
 
@@ -590,16 +592,19 @@ def test_extract_artifact_saved_after_opus_call_per_obs(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         pulse_extract, "call_sonnet_triage",
-        lambda _p, expected_count: [{"verdict": "extract"} for _ in range(expected_count)],
+        lambda _p, expected_count: ([{"verdict": "extract"} for _ in range(expected_count)], MOCK_USAGE),
     )
     call_ids: list = []
 
     def fake_extract(_prompt):
         call_ids.append(len(call_ids) + 1)
-        return {
-            "entities": [{"canonical_name": f"E{len(call_ids)}", "kind": "person"}],
-            "events": [], "relations": [], "facts": [],
-        }
+        return (
+            {
+                "entities": [{"canonical_name": f"E{len(call_ids)}", "kind": "person"}],
+                "events": [], "relations": [], "facts": [],
+            },
+            MOCK_USAGE,
+        )
 
     monkeypatch.setattr(pulse_extract, "call_opus_extract", fake_extract)
 
@@ -648,10 +653,13 @@ def test_restart_reuses_extract_artifact_per_obs(tmp_path, monkeypatch):
 
     def fake_opus(_prompt):
         opus_calls.append(_prompt)
-        return {
-            "entities": [{"canonical_name": "Fresh2", "kind": "person"}],
-            "events": [], "relations": [], "facts": [],
-        }
+        return (
+            {
+                "entities": [{"canonical_name": "Fresh2", "kind": "person"}],
+                "events": [], "relations": [], "facts": [],
+            },
+            MOCK_USAGE,
+        )
 
     monkeypatch.setattr(pulse_extract, "call_opus_extract", fake_opus)
 

@@ -5,9 +5,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pulse_extract
-from extract import prompts
 
 FIXTURES = Path(__file__).parent / "fixtures" / "extract_responses.json"
+MOCK_USAGE = {"input_tokens": 0, "output_tokens": 0, "model": "test"}
 
 
 def _seed(tmp_path):
@@ -37,14 +37,11 @@ def test_e2e_extraction_creates_graph(tmp_path, monkeypatch):
     fixtures = json.loads(FIXTURES.read_text())
     db = _seed(tmp_path)
 
-    def fake_triage(*_args, **_kwargs):
-        return prompts.parse_triage_response(fixtures["triage"], expected_count=2)
-
-    def fake_extract(_prompt):
-        return fixtures["extract_1"]
-
-    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", fake_triage)
-    monkeypatch.setattr(pulse_extract, "call_opus_extract", fake_extract)
+    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", lambda prompt, expected_count: (
+        [{"verdict": "extract", "reason": "mentions family"}, {"verdict": "skip", "reason": "trivial greeting"}],
+        MOCK_USAGE,
+    ))
+    monkeypatch.setattr(pulse_extract, "call_opus_extract", lambda prompt: (fixtures["extract_1"], MOCK_USAGE))
 
     rc = pulse_extract.run_once(str(db))
     assert rc == 0
@@ -69,14 +66,11 @@ def test_e2e_prints_apply_report(tmp_path, monkeypatch, capsys):
     fixtures = json.loads(FIXTURES.read_text())
     db = _seed(tmp_path)
 
-    def fake_triage(*_args, **_kwargs):
-        return prompts.parse_triage_response(fixtures["triage"], expected_count=2)
-
-    def fake_extract(_prompt):
-        return fixtures["extract_1"]
-
-    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", fake_triage)
-    monkeypatch.setattr(pulse_extract, "call_opus_extract", fake_extract)
+    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", lambda prompt, expected_count: (
+        [{"verdict": "extract", "reason": "mentions family"}, {"verdict": "skip", "reason": "trivial greeting"}],
+        MOCK_USAGE,
+    ))
+    monkeypatch.setattr(pulse_extract, "call_opus_extract", lambda prompt: (fixtures["extract_1"], MOCK_USAGE))
 
     rc = pulse_extract.run_once(str(db))
     assert rc == 0
