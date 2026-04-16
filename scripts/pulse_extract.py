@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from extract import prompts, resolver, scorer
+from extract import tool_schemas
 
 _client_cache = None
 
@@ -50,26 +51,36 @@ def _open_connection(db_path: str) -> sqlite3.Connection:
     return con
 
 
-def call_sonnet_triage(prompt: str, expected_count: int) -> list[dict]:
+def call_sonnet_triage(prompt: str, expected_count: int) -> tuple[list[dict], dict]:
     client = _anthropic_client()
     msg = client.messages.create(
         model=TRIAGE_MODEL,
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
+        tools=[tool_schemas.TRIAGE_TOOL],
+        tool_choice={"type": "tool", "name": "triage_observations"},
     )
-    text = "".join(block.text for block in msg.content if hasattr(block, "text"))
-    return prompts.parse_triage_response(text, expected_count)
+    usage = {"input_tokens": msg.usage.input_tokens, "output_tokens": msg.usage.output_tokens, "model": TRIAGE_MODEL}
+    for block in msg.content:
+        if block.type == "tool_use" and block.name == "triage_observations":
+            return block.input["verdicts"], usage
+    raise ValueError("Sonnet did not call triage_observations tool")
 
 
-def call_opus_extract(prompt: str) -> dict:
+def call_opus_extract(prompt: str) -> tuple[dict, dict]:
     client = _anthropic_client()
     msg = client.messages.create(
         model=EXTRACT_MODEL,
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
+        tools=[tool_schemas.EXTRACT_TOOL],
+        tool_choice={"type": "tool", "name": "save_extraction"},
     )
-    text = "".join(block.text for block in msg.content if hasattr(block, "text"))
-    return prompts.parse_extract_response(text)
+    usage = {"input_tokens": msg.usage.input_tokens, "output_tokens": msg.usage.output_tokens, "model": EXTRACT_MODEL}
+    for block in msg.content:
+        if block.type == "tool_use" and block.name == "save_extraction":
+            return block.input, usage
+    raise ValueError("Opus did not call save_extraction tool")
 
 
 def _load_observations(con: sqlite3.Connection, ids: list[int]) -> list[dict]:
@@ -133,9 +144,9 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
                 entity_id = dec.entity_id
             else:
                 cur = con.execute(
-                    "INSERT INTO entities (canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight, scorer_version) VALUES (?,?,?,?,?,?,?,?)",
+                    "INSERT INTO entities (canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight, scorer_version, extractor_version) VALUES (?,?,?,?,?,?,?,?,?)",
                     (ent["canonical_name"], ent.get("kind", "person"), json.dumps(ent.get("aliases") or []),
-                     now, now, scored["salience_score"], scored["emotional_weight"], scored["scorer_version"]),
+                     now, now, scored["salience_score"], scored["emotional_weight"], scored["scorer_version"], "v2"),
                 )
                 entity_id = cur.lastrowid
                 existing.append({"id": entity_id, "canonical_name": ent["canonical_name"], "kind": ent.get("kind", "person"), "aliases": ent.get("aliases") or []})
@@ -219,12 +230,13 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
         con.execute(f"SAVEPOINT {sp}")
         try:
             cur = con.execute(
-                """INSERT INTO relations (from_entity_id, to_entity_id, kind, strength, first_seen, last_seen)
-                   VALUES (?,?,?,?,?,?)
+                """INSERT INTO relations (from_entity_id, to_entity_id, kind, strength, first_seen, last_seen, context)
+                   VALUES (?,?,?,?,?,?,?)
                    ON CONFLICT(from_entity_id, to_entity_id, kind) DO UPDATE SET
                        strength  = strength + 1,
-                       last_seen = excluded.last_seen""",
-                (from_id, to_id, rel.get("kind", ""), float(rel.get("strength", 0.0)), now, now),
+                       last_seen = excluded.last_seen,
+                       context   = COALESCE(excluded.context, context)""",
+                (from_id, to_id, rel.get("kind", ""), float(rel.get("strength", 0.0)), now, now, rel.get("context")),
             )
             con.execute(
                 "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('relation',?,?,?)",
@@ -249,10 +261,10 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
         try:
             scored = scorer.score_fact(fact)
             cur = con.execute(
-                """INSERT INTO facts (entity_id, text, confidence, scorer_version, created_at)
-                   VALUES (?,?,?,?,?)
+                """INSERT INTO facts (entity_id, text, confidence, scorer_version, source_obs_id, extractor_version, created_at)
+                   VALUES (?,?,?,?,?,?,?)
                    ON CONFLICT(entity_id, text) DO NOTHING""",
-                (entity_id, fact.get("text", ""), scored["confidence"], scored["scorer_version"], now),
+                (entity_id, fact.get("text", ""), scored["confidence"], scored["scorer_version"], obs_id, "v2", now),
             )
             if cur.rowcount == 1:
                 con.execute(
@@ -334,6 +346,13 @@ def _save_artifact(con: sqlite3.Connection, job_id: int, kind: str,
     con.execute("COMMIT")
 
 
+def _save_metrics(con: sqlite3.Connection, job_id: int, usage: dict) -> None:
+    con.execute(
+        "INSERT INTO extraction_metrics (job_id, model, input_tokens, output_tokens) VALUES (?,?,?,?)",
+        (job_id, usage.get("model", "unknown"), usage.get("input_tokens"), usage.get("output_tokens")),
+    )
+
+
 def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
     con = _open_connection(db_path)
 
@@ -363,8 +382,9 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
                 verdicts = _get_artifact(con, job_id, "triage", None)
                 if verdicts is None:
                     triage_prompt = prompts.build_triage_prompt(observations)
-                    verdicts = call_sonnet_triage(triage_prompt, expected_count=len(observations))
+                    verdicts, triage_usage = call_sonnet_triage(triage_prompt, expected_count=len(observations))
                     _save_artifact(con, job_id, "triage", None, verdicts, TRIAGE_MODEL)
+                    _save_metrics(con, job_id, triage_usage)
                 job_reports: list[dict] = []
 
                 if len(verdicts) != len(observations):
@@ -378,8 +398,9 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
                     if result is None:
                         graph_ctx = {"existing_entities": _load_existing_entities(con)}
                         extract_prompt = prompts.build_extract_prompt(obs, graph_ctx)
-                        result = call_opus_extract(extract_prompt)
+                        result, extract_usage = call_opus_extract(extract_prompt)
                         _save_artifact(con, job_id, "extract", obs["id"], result, EXTRACT_MODEL)
+                        _save_metrics(con, job_id, extract_usage)
 
                     con.execute("BEGIN IMMEDIATE")
                     try:
