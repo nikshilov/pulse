@@ -1,2 +1,5 @@
 anthropic>=0.77.0
 httpx>=0.28.1
+
+# optional: for scripts/secure_db.py at-rest encryption
+# pysqlcipher3>=1.2.0
