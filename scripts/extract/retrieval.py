@@ -49,6 +49,8 @@ def retrieve_context(
     semantic: bool = False,
     semantic_top_n: int = 20,
     embedder_model: str = "fake-local",
+    intent: str | None = None,
+    auto_classify_intent: bool = True,
 ) -> dict:
     """Retrieve ranked entities for a user message.
 
@@ -75,6 +77,28 @@ def retrieve_context(
     keyword seeds, and compete on the same (salience+emo)×recency×anchor
     formula for the final top-k.
     """
+    # Resolve intent for downstream ranking. Three modes:
+    #   1. Caller passed intent="recent" etc — use it verbatim.
+    #   2. intent is None, auto_classify_intent=True (default) — classify from
+    #      the message via the rule-based classifier. This is ~free (regex)
+    #      and is correct for the six labelled cases the Garden-level bench
+    #      has shown to matter (Task D).
+    #   3. intent is None, auto_classify_intent=False — skip intent logic
+    #      entirely (backward-compat path, pre-Task-E behaviour).
+    resolved_intent: str | None
+    intent_classifier: str
+    if intent is not None:
+        resolved_intent = intent
+        intent_classifier = "provided"
+    elif auto_classify_intent:
+        # Deferred import so callers that disable auto-classify never pay it.
+        from extract.intent import classify_intent_rules
+        resolved_intent = classify_intent_rules(message)
+        intent_classifier = "rules"
+    else:
+        resolved_intent = None
+        intent_classifier = "disabled"
+
     tokens = _tokenize(message)
     seed_entities = _match_entities(con, tokens)
     seed_ids = {ent["id"] for ent in seed_entities}
@@ -136,7 +160,7 @@ def retrieve_context(
 
                 frontier.append((neighbor_id, neighbor_hop))
 
-    ranked = _rank(list(all_entities.values()))
+    ranked = _rank(list(all_entities.values()), intent=resolved_intent)
     trimmed = ranked[:top_k]
 
     result = {
@@ -144,6 +168,8 @@ def retrieve_context(
         "total_matched": len(all_entities),
         "retrieval_method": "hybrid" if semantic else "keyword",
         "max_depth_used": max_depth_used,
+        "intent": resolved_intent if resolved_intent is not None else "none",
+        "intent_classifier": intent_classifier,
     }
     if semantic:
         result["semantic_seeds"] = semantic_seed_ids
@@ -352,10 +378,91 @@ def _get_facts(con: sqlite3.Connection, entity_id: int) -> list[dict]:
     return [{"text": r[0], "confidence": r[1], "verified": bool(r[2])} for r in rows]
 
 
-def _rank(entities: list[dict]) -> list[dict]:
+def _days_since_last_seen(ent: dict) -> int | None:
+    """Days between now and `ent['last_seen']` (ISO string). None if unparseable.
+
+    Used by `_apply_intent_boost` for the `recent` intent. Kept tolerant of
+    missing/garbage timestamps — callers should treat None as "freshness
+    unknown" and fall back to neutral boost (1.0) so a malformed row doesn't
+    demote or promote an otherwise valid entity.
+    """
+    ls = ent.get("last_seen")
+    if not ls:
+        return None
+    try:
+        if isinstance(ls, str):
+            last = datetime.fromisoformat(ls.replace("Z", "+00:00"))
+        else:
+            return None
+    except (ValueError, AttributeError, TypeError):
+        return None
+    now = datetime.now(timezone.utc)
+    # last may be naive — assume UTC for naive strings
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    delta = (now - last).days
+    return max(0, delta)
+
+
+def _apply_intent_boost(ent: dict, intent: str | None) -> float:
+    """Multiplicative boost factor based on intent vs entity properties.
+
+    Preserves the baseline (boost=1.0) when intent is None or `cold_open`.
+    Other intents nudge entities toward what that intent needs most:
+
+    - recent         : favour entities touched in the last 30 days, demote >60d
+    - weighs         : favour high emotional_weight persons, demote trivial
+    - anchor_family  : favour persons, demote projects/places/concepts
+    - opener         : mild favour for emotionally central entities
+    - decoy_resist   : inverse of `weighs` — demote high-emo entities (so
+                       emotional landmines don't surface when user asked for
+                       something light)
+
+    Baseline (cold_open / None) returns 1.0 so the Garden-style scoring from
+    Task A/B is byte-identical. This is what keeps the `auto_classify_intent=True`
+    default safe: the most common classifier outputs (cold_open for ambiguous
+    queries) don't perturb the ranking at all.
+    """
+    if intent is None or intent == "cold_open":
+        return 1.0
+    if intent == "recent":
+        days_ago = _days_since_last_seen(ent)
+        if days_ago is None or days_ago > 60:
+            return 0.7
+        if days_ago < 7:
+            return 1.4
+        if days_ago < 30:
+            return 1.2
+        return 1.0
+    if intent == "weighs":
+        emo = float(ent.get("emotional_weight") or 0.0)
+        if emo < 0.3:
+            return 0.7
+        if emo > 0.7:
+            return 1.3
+        return 1.0
+    if intent == "anchor_family":
+        if ent.get("kind") == "person":
+            return 1.3
+        return 0.6
+    if intent == "opener":
+        emo = float(ent.get("emotional_weight") or 0.0)
+        if emo > 0.6:
+            return 1.2
+        return 1.0
+    if intent == "decoy_resist":
+        emo = float(ent.get("emotional_weight") or 0.0)
+        if emo > 0.7:
+            return 0.6
+        return 1.0
+    return 1.0
+
+
+def _rank(entities: list[dict], intent: str | None = None) -> list[dict]:
     """Rank entities by Garden-style empathic formula.
 
         score = (salience + emotional_weight) × recency × anchor × hop_penalty
+                × self_penalty × intent_boost
 
     - recency       exp(-λ × days), λ = DECAY_RATES[kind] — retrieval-time decay
                     (non-destructive, unlike mutation-based decay in consolidation)
@@ -380,6 +487,10 @@ def _rank(entities: list[dict]) -> list[dict]:
       gate is `do_not_probe=1`, applied upstream in `_match_entities` and
       `_get_entity_full`.
     - hop_penalty   0.7 ^ hop (direct match > 1-hop > 2-hop)
+    - intent_boost  multiplicative factor from `_apply_intent_boost`. 1.0 when
+                    intent is None or `cold_open`. Task E (production intent
+                    wiring) — nudges ranking toward what the query needs
+                    (recency, emotional weight, family scope, etc.).
     """
     now = datetime.now(timezone.utc)
     scored = []
@@ -410,6 +521,8 @@ def _rank(entities: list[dict]) -> list[dict]:
         hop_penalty = 0.7 ** hop
 
         score = (salience + emo) * recency * anchor * hop_penalty * self_penalty
+        intent_boost = _apply_intent_boost(ent, intent)
+        score *= intent_boost
         scored.append((score, ent))
 
     scored.sort(key=lambda x: x[0], reverse=True)
