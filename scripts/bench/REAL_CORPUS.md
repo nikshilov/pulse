@@ -51,7 +51,20 @@ python scripts/bench/run_real_eval.py --corpus /path/to/corpus.json
 
 # Retrieval parameters (defaults match production: top_k=10, depth=2)
 python scripts/bench/run_real_eval.py --top-k 10 --depth 2
+
+# Hybrid retrieval (keyword + semantic embeddings).
+# NOTE: semantic-top-n default is 20 — on this small corpus (7 persons) that
+# admits everything into seed and the embedder can't discriminate. Set it
+# BELOW corpus size (e.g. 3) so cosine actually selects.
+python scripts/bench/run_real_eval.py --semantic --embedder-model openai-text-embedding-3-large --semantic-top-n 3
+
+# Side-by-side keyword vs hybrid with delta table
+python scripts/bench/run_real_eval.py --compare --embedder-model openai-text-embedding-3-large --semantic-top-n 3
 ```
+
+Requires `OPENAI_API_KEY` env var for the `openai-*` embedder model.
+`fake-local` works offline but produces no real semantic signal (SHA-based
+hash fallback for plumbing tests).
 
 ## Ingest strategy
 
@@ -96,7 +109,7 @@ invocation. There is no persistent state — just run the script again. No
 ## Interpreting the baseline
 
 The April 2026 first run (`bench/real-corpus` branch, commit after this
-doc) produces:
+doc) produced:
 
 | Metric | Value |
 |--------|-------|
@@ -104,6 +117,16 @@ doc) produces:
 | Recall@10 | ~0.93 ± 0.13 |
 | MRR | ~0.43 ± 0.08 |
 | Critical-hit@1 | 0.00 |
+
+### Evolution log (this bench's whole point)
+
+| Date | Change | R@5 | R@10 | MRR | Crit@1 |
+|------|--------|-----|------|-----|--------|
+| 2026-04-17 AM | Initial baseline (Garden-scoring + safety gates + is_self anchor strip) | 0.867 | 0.933 | 0.433 | 0.000 |
+| 2026-04-17 PM | **Task A:** self-penalty 0.5 on top of anchor strip (`_rank`) | 0.867 | 0.933 | **0.800** | **0.600** |
+| 2026-04-17 PM | **Task B:** + OpenAI `text-embedding-3-large` hybrid seed (top-n=3) | **0.933** | **1.000** | **0.900** | **0.800** |
+
+Cumulative delta since morning: Crit@1 **+0.800**, MRR **+0.467**, R@5 **+0.067**, R@10 **+0.067**.
 
 Compared with the synthetic fixture bench (`scripts/bench/run_eval.py` on
 the Elle/Nik fixture):

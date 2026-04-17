@@ -59,6 +59,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from extract.retrieval import retrieve_context  # noqa: E402
+from pulse_consolidate import embed_entities  # noqa: E402
 
 
 DEFAULT_CORPUS_PATH = Path(
@@ -326,9 +327,16 @@ def _rank_of_first_correct(returned_ids: list[int], gt: set[int]) -> int | None:
 
 
 def _run_query(
-    con: sqlite3.Connection, test: dict, gt: set[int], top_k: int = 10, depth: int = 2
+    con: sqlite3.Connection, test: dict, gt: set[int],
+    top_k: int = 10, depth: int = 2,
+    semantic: bool = False, embedder_model: str = "fake-local",
+    semantic_top_n: int = 20,
 ) -> dict:
-    result = retrieve_context(con, test["user_query"], top_k=top_k, depth=depth)
+    result = retrieve_context(
+        con, test["user_query"], top_k=top_k, depth=depth,
+        semantic=semantic, embedder_model=embedder_model,
+        semantic_top_n=semantic_top_n,
+    )
     returned = [e["id"] for e in result["matched_entities"]]
 
     top5 = set(returned[:5])
@@ -437,17 +445,31 @@ def run(
     verbose: bool = False,
     top_k: int = 10,
     depth: int = 2,
+    semantic: bool = False,
+    embedder_model: str = "fake-local",
+    semantic_top_n: int = 20,
 ) -> dict:
     """Run the full eval. Returns dict with summary + per_query for tests."""
     corpus = json.loads(Path(corpus_path).read_text())
     con = fresh_db()
     stats = ingest_corpus(con, corpus)
 
+    # Generate embeddings once per run (costs ~3k tokens for 7 entities via OpenAI,
+    # zero cost for fake-local). Only triggered if caller asked for semantic mode.
+    if semantic:
+        n = embed_entities(con, embedder_model=embedder_model, only_missing=True)
+        stats["embedded"] = n
+        stats["embedder_model"] = embedder_model
+
     per_query: list[dict] = []
     tests = corpus.get("tests", [])
     for test in tests:
         gt = events_to_entity_gt(con, test["ideal_top_3_event_ids"])
-        per_query.append(_run_query(con, test, gt, top_k=top_k, depth=depth))
+        per_query.append(_run_query(
+            con, test, gt, top_k=top_k, depth=depth,
+            semantic=semantic, embedder_model=embedder_model,
+            semantic_top_n=semantic_top_n,
+        ))
 
     if verbose:
         _print_verbose(per_query)
@@ -465,6 +487,34 @@ def run(
     }
 
 
+def _run_compare(
+    corpus_path: Path, top_k: int, depth: int,
+    embedder_model: str, semantic_top_n: int,
+) -> int:
+    """Run keyword-only AND hybrid back-to-back, print side-by-side deltas."""
+    print(">>> KEYWORD-ONLY baseline\n")
+    baseline = run(corpus_path=corpus_path, verbose=False, top_k=top_k,
+                   depth=depth, semantic=False)
+    print(f">>> HYBRID (keyword + semantic, {embedder_model}, top_n={semantic_top_n})\n")
+    hybrid = run(corpus_path=corpus_path, verbose=False, top_k=top_k,
+                 depth=depth, semantic=True, embedder_model=embedder_model,
+                 semantic_top_n=semantic_top_n)
+    print()
+    print("=" * 78)
+    print(f"DELTA:  hybrid − keyword  (embedder={embedder_model})")
+    print("=" * 78)
+    print(f"  {'metric':<14}  {'keyword':>10}  {'hybrid':>10}  {'delta':>10}")
+    for key, label in [("recall_5", "Recall@5"), ("recall_10", "Recall@10"),
+                       ("mrr", "MRR"), ("crit_hit", "Crit-hit@1")]:
+        km = baseline["summary"][key][0]
+        hm = hybrid["summary"][key][0]
+        d = hm - km
+        arrow = "↑" if d > 0.001 else ("↓" if d < -0.001 else "=")
+        print(f"  {label:<14}  {km:>10.3f}  {hm:>10.3f}  {d:+10.3f} {arrow}")
+    print()
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Pulse retrieval on the real empathic corpus")
     p.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS_PATH,
@@ -474,17 +524,38 @@ def main() -> int:
     p.add_argument("--top-k", type=int, default=10)
     p.add_argument("--depth", type=int, default=2,
                    help="BFS depth for retrieval")
+    p.add_argument("--semantic", action="store_true",
+                   help="enable hybrid retrieval (keyword + embeddings)")
+    p.add_argument("--embedder-model", default="fake-local",
+                   choices=["fake-local", "openai-text-embedding-3-large"],
+                   help="embedding backend (default: fake-local, zero cost)")
+    p.add_argument("--compare", action="store_true",
+                   help="run keyword-only AND hybrid, print side-by-side deltas")
+    p.add_argument("--semantic-top-n", type=int, default=20,
+                   help="how many top-cosine entities to inject into seed "
+                        "(default 20; set lower — e.g. 3 — on small corpora "
+                        "so embeddings can actually discriminate)")
     args = p.parse_args()
 
     if not args.corpus.exists():
         print(f"ERROR: corpus not found at {args.corpus}", file=sys.stderr)
         return 2
 
+    if args.compare:
+        return _run_compare(
+            corpus_path=args.corpus, top_k=args.top_k, depth=args.depth,
+            embedder_model=args.embedder_model,
+            semantic_top_n=args.semantic_top_n,
+        )
+
     result = run(
         corpus_path=args.corpus,
         verbose=args.verbose,
         top_k=args.top_k,
         depth=args.depth,
+        semantic=args.semantic,
+        embedder_model=args.embedder_model,
+        semantic_top_n=args.semantic_top_n,
     )
     assert all(math.isfinite(q["recall_5"]) for q in result["per_query"])
     return 0
