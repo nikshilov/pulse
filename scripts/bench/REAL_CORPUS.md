@@ -125,6 +125,7 @@ doc) produced:
 | 2026-04-17 AM | Initial baseline (Garden-scoring + safety gates + is_self anchor strip) | 0.867 | 0.933 | 0.433 | 0.000 |
 | 2026-04-17 PM | **Task A:** self-penalty 0.5 on top of anchor strip (`_rank`) | 0.867 | 0.933 | **0.800** | **0.600** |
 | 2026-04-17 PM | **Task B:** + OpenAI `text-embedding-3-large` hybrid seed (top-n=3) | **0.933** | **1.000** | **0.900** | **0.800** |
+| 2026-04-17 eve | **Task E:** intent wired into production retrieval (`retrieve_context`, keyword-only) | **0.933** | 0.933 | 0.800 | 0.600 |
 
 Cumulative delta since morning: Crit@1 **+0.800**, MRR **+0.467**, R@5 **+0.067**, R@10 **+0.067**.
 
@@ -215,6 +216,71 @@ engagement (#2, flagged positive) to slot 3 instead. A "family-scoped"
 flag heuristic could fix it but would require corpus-level tuning. Left
 as a known limit.
 
+### Evolution — Task E (2026-04-17 evening, production wiring)
+
+**Change:** intent-aware ranking wired into the production retrieval path.
+`extract.retrieval.retrieve_context()` now takes two new optional parameters:
+
+- `intent: str | None = None`           — one of the six Task-D labels
+- `auto_classify_intent: bool = True`   — if `intent` is None, run
+  `extract.intent.classify_intent_rules(message)` (rule-based, no LLM)
+
+Output adds two keys: `"intent"` (the resolved label, or `"none"` if
+disabled) and `"intent_classifier"` (`"provided"` | `"rules"` | `"disabled"`).
+
+Inside `_rank`, a new `_apply_intent_boost(ent, intent)` multiplies the
+Garden-style score by a per-intent factor:
+
+- `cold_open` / `None`  → 1.0 (byte-identical to Task A/B baseline)
+- `recent`              → 1.4 / 1.2 / 1.0 / 0.7 on <7 / <30 / ≤60 / >60 days
+- `weighs`              → 1.3 / 1.0 / 0.7 on emo >0.7 / 0.3–0.7 / <0.3
+- `anchor_family`       → 1.3 for persons, 0.6 for everything else
+- `opener`              → 1.2 if emotional_weight > 0.6, else 1.0
+- `decoy_resist`        → 0.6 for emo > 0.7, else 1.0
+
+Elle (production) calls `retrieve_context(con, message)` and transparently
+gets intent-routed ranking. LLM-judge bench (`run_llm_judge.py`) is
+untouched — it does its own memory-level ranking AFTER entity retrieval.
+Task E is the production-path piece of that win.
+
+**Before → after (Recall/MRR, keyword-only):**
+
+| Metric | Before | After | Δ |
+|--------|--------|-------|------|
+| R@5    | 0.867  | 0.933 | **+0.067** |
+| R@10   | 0.933  | 0.933 | ±0.000 |
+| MRR    | 0.800  | 0.800 | ±0.000 |
+| Crit@1 | 0.600  | 0.600 | ±0.000 |
+
+**Per-query moves (keyword-only):**
+
+- **T4 "recency_aware_state" R@5: 0.67 → 1.00 (+0.33).** Query
+  auto-classifies to `recent`. Maya (id=4) is GT and was ranking 6th in the
+  return list — the `recent` boost pulled fresher entities up, landing her
+  inside top-5. This is the headline win.
+- **T3 "sentiment_weighted_what_weighs"** auto-classifies to `weighs`.
+  Ranking did not change because the corpus emo spread across persons is
+  narrow (all in 0.2–0.5 band, none in either the <0.3 demote bucket or the
+  >0.7 promote bucket) — the boost mostly stays at 1.0. A future corpus with
+  more spread, or per-event emo propagation into the entity score, would
+  light this up. No regression.
+- **T1, T2, T5** classify to `cold_open` / `anchor_family`. T2/T5 boost
+  persons but all six matched entities are already persons, so the relative
+  ordering is preserved. T1's `cold_open` is a no-op by design.
+
+**What helped most:** the `recent` intent (T4 R@5 +0.33). **What hurt:**
+nothing — no test's R@5/R@10/MRR/Crit@1 went down. `anchor_family` on
+T2/T5 is effectively a no-op on this corpus because the BFS closure is all
+persons (Alex + 6 humans).
+
+**Caveat.** LLM-judge bench is unchanged. Task D lives in
+`scripts/bench/run_llm_judge.py:_pull_top_memories` and operates on EVENTS
+after entity retrieval — that's not what `retrieve_context` returns.
+Production Elle now sees intent-aware ENTITY ranking via `retrieve_context`;
+she does not yet see intent-aware EVENT/FACT surfacing (the caller can
+filter the returned facts using the now-exposed `"intent"` key). That is
+follow-up work.
+
 Compared with the synthetic fixture bench (`scripts/bench/run_eval.py` on
 the Elle/Nik fixture):
 
@@ -280,3 +346,16 @@ moved.
   finite metrics
 
 Tests skip cleanly when the corpus JSON is not present on disk.
+
+`scripts/tests/test_retrieval_intent.py` (Task E):
+
+- `test_retrieve_context_passes_explicit_intent` — caller-provided intent
+  flows through without auto-classify
+- `test_retrieve_context_auto_classifies_intent_from_message` — default
+  path: message → rules classifier → resolved label in result
+- `test_retrieve_context_auto_classify_disabled_returns_none_intent` —
+  opt-out backward-compat path returns `intent="none"`
+- `test_rank_intent_recent_boosts_fresh_entity` — `recent` promotes 3d over 90d
+- `test_rank_intent_weighs_demotes_low_emo_entity` — `weighs` promotes high-emo
+- `test_rank_intent_anchor_family_demotes_projects` — persons outrank projects
+- `test_rank_intent_decoy_resist_demotes_high_emo` — inverse of weighs
