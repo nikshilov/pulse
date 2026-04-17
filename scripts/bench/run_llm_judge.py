@@ -90,12 +90,25 @@ JUDGE_PROMPT_PATH = Path(
 )
 
 
-# Cross-judge panel. Exact model IDs. Ordering matters for the output table.
+# Cross-judge panel — April 2026 12-judge parity panel (Task F2 / 2026-04-17).
+# Ordering matters for the output table (grouped by provider family).
 CROSS_JUDGE_MODELS: list[str] = [
+    # Anthropic family
     "claude-opus-4-6",
     "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+    # OpenAI family
     "gpt-4o",
+    "gpt-5-mini",
+    "gpt-4o-mini",
+    # Google family
     "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    # OpenAI-compatible third-party providers
+    "grok-4",
+    "glm-4.6",
+    "qwen-max",
+    "kimi-k2-0905-preview",
 ]
 
 
@@ -104,7 +117,46 @@ _SECRET_PATHS = {
     "ANTHROPIC_API_KEY": Path.home() / ".openclaw/secrets/anthropic-api-key.txt",
     "OPENAI_API_KEY": Path.home() / ".openclaw/secrets/openai.txt",
     "GEMINI_API_KEY": Path.home() / ".openclaw/secrets/gemini-key.txt",
+    "GROK_API_KEY": Path.home() / ".openclaw/secrets/grok-api-key.txt",
+    "ZAI_API_KEY": Path.home() / ".openclaw/secrets/zai-api-key.txt",
+    "QWEN_API_KEY": Path.home() / ".openclaw/secrets/qwen-api-key.txt",
+    "KIMI_API_KEY": Path.home() / ".openclaw/secrets/kimi-api-key.txt",
 }
+
+
+# OpenAI-compatible third-party endpoints (same chat.completions shape).
+# Used by grok-*, glm-*, qwen-*, kimi-*/moonshot-*. Base URLs verified
+# 2026-04-17 via dry-run probes against each provider.
+_OPENAI_COMPAT_PROVIDERS = {
+    "grok": {
+        "base_url": "https://api.x.ai/v1",
+        "env_var": "GROK_API_KEY",
+    },
+    "glm": {
+        "base_url": "https://api.z.ai/api/paas/v4",
+        "env_var": "ZAI_API_KEY",
+    },
+    "qwen": {
+        "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "env_var": "QWEN_API_KEY",
+    },
+    "kimi": {
+        "base_url": "https://api.moonshot.ai/v1",
+        "env_var": "KIMI_API_KEY",
+    },
+    "moonshot": {
+        "base_url": "https://api.moonshot.ai/v1",
+        "env_var": "KIMI_API_KEY",
+    },
+}
+
+
+# Per-call timeout (seconds). Some third-party providers (grok, glm) can be slow.
+_JUDGE_CALL_TIMEOUT = 60.0
+
+# Retry-once transient error substrings.
+_TRANSIENT_ERRORS = ("timeout", "timed out", "503", "502", "504",
+                     "connection reset", "connection aborted", "overloaded")
 
 
 def _load_key(env_var: str) -> str | None:
@@ -171,18 +223,38 @@ def _parse_judge_json(text: str) -> dict:
         raise
 
 
+def _is_transient(ex: Exception) -> bool:
+    """Heuristic: the error looks retriable (timeout / 5xx / reset)."""
+    msg = str(ex).lower()
+    return any(tok in msg for tok in _TRANSIENT_ERRORS)
+
+
+def _with_retry(fn, *args, **kwargs):
+    """Call `fn(*args, **kwargs)`; if it raises a transient error, retry once."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as ex:  # noqa: BLE001
+        if _is_transient(ex):
+            return fn(*args, **kwargs)
+        raise
+
+
 def _claude_judge(model: str, system_prompt: str, user_msg: str) -> dict:
     import anthropic  # deferred import
     key = _load_key("ANTHROPIC_API_KEY")
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY required for Claude judge")
-    client = anthropic.Anthropic(api_key=key)
-    resp = client.messages.create(
-        model=model,
-        max_tokens=1024,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_msg}],
-    )
+    client = anthropic.Anthropic(api_key=key, timeout=_JUDGE_CALL_TIMEOUT)
+
+    def _do():
+        return client.messages.create(
+            model=model,
+            max_tokens=1024,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+
+    resp = _with_retry(_do)
     text = ""
     for block in resp.content:
         if block.type == "text":
@@ -195,27 +267,108 @@ def _claude_judge(model: str, system_prompt: str, user_msg: str) -> dict:
         )
 
 
-def _openai_judge(model: str, system_prompt: str, user_msg: str) -> dict:
+def _openai_judge(model: str, system_prompt: str, user_msg: str,
+                  *, base_url: str | None = None,
+                  api_key: str | None = None,
+                  response_format_json: bool = True) -> dict:
+    """Chat completions via any OpenAI-compatible endpoint.
+
+    When `base_url` / `api_key` are None, uses OpenAI itself (default endpoint,
+    OPENAI_API_KEY). Used by `_openai_compatible_judge` with a specific provider's
+    base_url + key for grok/glm/qwen/kimi routing.
+
+    - `response_format_json` — pass `{"type": "json_object"}`. OpenAI's own
+      chat.completions supports this; some third-party compats may reject it
+      (we fall back silently if the server refuses).
+    - GPT-5 family uses `max_completion_tokens` instead of `max_tokens`.
+    """
     from openai import OpenAI  # deferred import
-    key = _load_key("OPENAI_API_KEY")
-    if not key:
-        raise RuntimeError("OPENAI_API_KEY required for OpenAI judge")
-    client = OpenAI(api_key=key)
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
+    if api_key is None:
+        api_key = _load_key("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("API key missing for OpenAI-compatible judge")
+    client = OpenAI(api_key=api_key, base_url=base_url,
+                    timeout=_JUDGE_CALL_TIMEOUT)
+
+    # GPT-5 family requires max_completion_tokens rather than max_tokens.
+    use_completion_tokens = model.startswith("gpt-5")
+    token_kw = "max_completion_tokens" if use_completion_tokens else "max_tokens"
+    # gpt-5-mini with reasoning can burn its output budget on hidden thinking;
+    # give it a generous ceiling so there's budget left for the JSON.
+    token_budget = 4096 if use_completion_tokens else 1024
+
+    kwargs = {
+        "model": model,
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg},
         ],
-        response_format={"type": "json_object"},
-    )
+        token_kw: token_budget,
+    }
+    if response_format_json:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    def _do():
+        return client.chat.completions.create(**kwargs)
+
+    try:
+        resp = _with_retry(_do)
+    except Exception as ex:  # noqa: BLE001
+        # Some providers reject response_format; retry once without it.
+        if response_format_json and "response_format" in str(ex).lower():
+            kwargs.pop("response_format", None)
+            resp = _with_retry(_do)
+        else:
+            raise
+
     text = resp.choices[0].message.content or ""
+    # Empty-string rescue: some providers (notably GLM) accept
+    # response_format=json_object but return "" for long prompts. If we asked
+    # for JSON and got empty, retry once with response_format dropped.
+    if not text.strip() and response_format_json:
+        kwargs.pop("response_format", None)
+        resp = _with_retry(_do)
+        text = resp.choices[0].message.content or ""
     try:
         return _parse_judge_json(text)
     except json.JSONDecodeError as ex:
         raise RuntimeError(
             f"{model} returned non-JSON: {ex}\n---\n{text[:500]}"
         )
+
+
+def _openai_compatible_judge(model: str, system_prompt: str, user_msg: str,
+                             *, provider_key: str) -> dict:
+    """Dispatch to an OpenAI-compatible third-party (grok/glm/qwen/kimi).
+
+    Reads `_OPENAI_COMPAT_PROVIDERS[provider_key]` for base_url and env_var,
+    loads the key, and delegates to `_openai_judge` with the right plumbing.
+
+    Third-party compats are less likely to honor `response_format=json_object`;
+    we pass it but fall back on error (handled inside _openai_judge).
+    """
+    cfg = _OPENAI_COMPAT_PROVIDERS.get(provider_key)
+    if cfg is None:
+        raise ValueError(f"unknown OpenAI-compatible provider: {provider_key}")
+    key = _load_key(cfg["env_var"])
+    if not key:
+        raise RuntimeError(
+            f"{cfg['env_var']} required for {provider_key} judge"
+        )
+    # GLM-4.6 accepts response_format=json_object without error, but returns an
+    # empty string for long rubric prompts (observed 4/5 empty responses in the
+    # 12-judge run 2026-04-17). Disable the flag for glm specifically; the
+    # system-prompt already instructs "return ONLY JSON" and our parser strips
+    # any accidental code fences / trailing prose.
+    #
+    # Grok / Qwen / Kimi (Moonshot) handle response_format fine; keep it on —
+    # _openai_judge retries without if any server refuses.
+    response_format_json = provider_key != "glm"
+    return _openai_judge(
+        model, system_prompt, user_msg,
+        base_url=cfg["base_url"], api_key=key,
+        response_format_json=response_format_json,
+    )
 
 
 def _gemini_judge(model: str, system_prompt: str, user_msg: str) -> dict:
@@ -232,7 +385,14 @@ def _gemini_judge(model: str, system_prompt: str, user_msg: str) -> dict:
     model_obj = genai.GenerativeModel(model)
     # Gemini doesn't have a native system prompt for generate_content; prepend.
     prompt = system_prompt + "\n\n" + user_msg
-    response = model_obj.generate_content(prompt)
+
+    def _do():
+        return model_obj.generate_content(
+            prompt,
+            request_options={"timeout": _JUDGE_CALL_TIMEOUT},
+        )
+
+    response = _with_retry(_do)
     text = getattr(response, "text", None) or ""
     try:
         return _parse_judge_json(text)
@@ -246,6 +406,15 @@ def judge_call(model: str, system_prompt: str, user_msg: str) -> dict:
     """Provider-agnostic judge call. Routes by model prefix.
 
     Returns the parsed JSON score dict (per-system `S01_rel` etc. + `note`).
+
+    Prefix routing (order matters — more specific prefixes first):
+      - claude-*                  → Anthropic Messages API
+      - gpt-*                     → OpenAI chat.completions
+      - gemini-*                  → Google Generative AI
+      - grok-*                    → xAI (OpenAI-compat)
+      - glm-*                     → z.ai (OpenAI-compat)
+      - qwen-*                    → Alibaba DashScope International (OpenAI-compat)
+      - kimi-* / moonshot-*       → Moonshot (OpenAI-compat)
     """
     if model.startswith("claude-"):
         return _claude_judge(model, system_prompt, user_msg)
@@ -253,6 +422,18 @@ def judge_call(model: str, system_prompt: str, user_msg: str) -> dict:
         return _openai_judge(model, system_prompt, user_msg)
     if model.startswith("gemini-"):
         return _gemini_judge(model, system_prompt, user_msg)
+    if model.startswith("grok-"):
+        return _openai_compatible_judge(model, system_prompt, user_msg,
+                                        provider_key="grok")
+    if model.startswith("glm-"):
+        return _openai_compatible_judge(model, system_prompt, user_msg,
+                                        provider_key="glm")
+    if model.startswith("qwen-") or model.startswith("qwen3-"):
+        return _openai_compatible_judge(model, system_prompt, user_msg,
+                                        provider_key="qwen")
+    if model.startswith("kimi-") or model.startswith("moonshot-"):
+        return _openai_compatible_judge(model, system_prompt, user_msg,
+                                        provider_key="kimi")
     raise ValueError(f"unknown judge model: {model}")
 
 
@@ -628,17 +809,38 @@ def run_cross_judge(
     judge_prompt = JUDGE_PROMPT_PATH.read_text()
     system_label = "System 01 (Pulse hybrid)"
 
-    # Resolve judge panel. Skip Gemini gracefully if SDK/key missing.
+    # Resolve judge panel. Skip judges gracefully if their SDK/key is missing;
+    # remaining auth / quota / bad-model-ID failures are caught later at the
+    # per-call site so one dead judge never aborts the whole run.
     panel = list(judges) if judges else list(CROSS_JUDGE_MODELS)
     resolved: list[str] = []
+    skipped_preflight: list[tuple[str, str]] = []  # (model, reason)
     for m in panel:
         if m.startswith("gemini-") and not _gemini_available():
-            print(
-                f"WARN: {m} skipped — google-generativeai package missing "
-                f"or GEMINI_API_KEY not resolvable",
-                file=sys.stderr,
-            )
+            reason = "google-generativeai missing or GEMINI_API_KEY unresolvable"
+            print(f"WARN: {m} skipped — {reason}", file=sys.stderr)
+            skipped_preflight.append((m, reason))
             continue
+        # Third-party compat providers: check key existence up-front.
+        compat_check = None
+        for prefix, provider in (
+            ("grok-", "grok"),
+            ("glm-", "glm"),
+            ("qwen-", "qwen"),
+            ("qwen3-", "qwen"),
+            ("kimi-", "kimi"),
+            ("moonshot-", "moonshot"),
+        ):
+            if m.startswith(prefix):
+                compat_check = provider
+                break
+        if compat_check:
+            cfg = _OPENAI_COMPAT_PROVIDERS[compat_check]
+            if not _load_key(cfg["env_var"]):
+                reason = f"{cfg['env_var']} unresolvable"
+                print(f"WARN: {m} skipped — {reason}", file=sys.stderr)
+                skipped_preflight.append((m, reason))
+                continue
         resolved.append(m)
 
     # STEP 1 — Run retrieval once per test. Memories are what the judges see.
@@ -694,6 +896,7 @@ def run_cross_judge(
                       f"rel={rel} spec={spec} act={act} total={total}/30")
 
         valid = [t for t in per_test if not t.get("failed")]
+        all_failed = len(valid) == 0
         n = len(valid) or 1
         judge_results.append({
             "model": model,
@@ -703,13 +906,22 @@ def run_cross_judge(
             "mean_total": sum(t["total"] for t in valid) / n,
             "per_test": per_test,
             "errors": errors,
+            "fully_failed": all_failed,
         })
+        if all_failed and errors:
+            # Surface this immediately — the judge will be dropped from the mean.
+            print(
+                f"WARN: {model} failed on all {len(errors)} tests; "
+                f"dropping from cross-judge mean. First error: {errors[0]}",
+                file=sys.stderr,
+            )
 
-    # STEP 3 — Aggregate across judges.
-    totals = [j["mean_total"] for j in judge_results]
-    rels = [j["mean_rel"] for j in judge_results]
-    specs = [j["mean_spec"] for j in judge_results]
-    acts = [j["mean_act"] for j in judge_results]
+    # STEP 3 — Aggregate across judges, dropping any that fully failed.
+    scoring_judges = [j for j in judge_results if not j.get("fully_failed")]
+    totals = [j["mean_total"] for j in scoring_judges]
+    rels = [j["mean_rel"] for j in scoring_judges]
+    specs = [j["mean_spec"] for j in scoring_judges]
+    acts = [j["mean_act"] for j in scoring_judges]
     n = len(totals) or 1
     mean = sum(totals) / n
     if len(totals) > 1:
@@ -720,9 +932,12 @@ def run_cross_judge(
 
     return {
         "judges": judge_results,
-        "mean_rel_across_judges": sum(rels) / n,
-        "mean_spec_across_judges": sum(specs) / n,
-        "mean_act_across_judges": sum(acts) / n,
+        "skipped_preflight": skipped_preflight,
+        "n_scoring_judges": len(scoring_judges),
+        "n_panel": len(panel),
+        "mean_rel_across_judges": sum(rels) / n if rels else 0.0,
+        "mean_spec_across_judges": sum(specs) / n if specs else 0.0,
+        "mean_act_across_judges": sum(acts) / n if acts else 0.0,
         "mean_total_across_judges": mean,
         "stddev_total_across_judges": stddev,
     }
@@ -733,8 +948,16 @@ def _short_judge_name(model: str) -> str:
     mapping = {
         "claude-opus-4-6": "claude-opus-4-6",
         "claude-sonnet-4-6": "claude-sonnet-4-6",
+        "claude-haiku-4-5-20251001": "claude-haiku-4-5",
         "gpt-4o": "gpt-4o",
+        "gpt-5-mini": "gpt-5-mini",
+        "gpt-4o-mini": "gpt-4o-mini",
         "gemini-2.5-pro": "gemini-2.5-pro",
+        "gemini-2.5-flash": "gemini-2.5-flash",
+        "grok-4": "grok-4",
+        "glm-4.6": "glm-4.6",
+        "qwen-max": "qwen-max",
+        "kimi-k2-0905-preview": "kimi-k2",
     }
     return mapping.get(model, model)
 
@@ -745,19 +968,39 @@ def _print_cross_judge_result(r: dict) -> None:
     print("PULSE hybrid — CROSS-JUDGE validation on empathic-memory-corpus")
     print("=" * 78)
     print()
-    print(f"{'JUDGE':<22} {'Rel':>6} {'Spec':>6} {'Act':>6} {'Total /30':>12}")
-    print("-" * 58)
+    header = f"{'JUDGE':<24} {'Rel':>6} {'Spec':>6} {'Act':>6} {'Total /30':>12}"
+    print(header)
+    print("-" * len(header))
     for j in r["judges"]:
         label = _short_judge_name(j["model"])
-        print(f"{label:<22} "
-              f"{j['mean_rel']:>6.2f} {j['mean_spec']:>6.2f} "
-              f"{j['mean_act']:>6.2f} {j['mean_total']:>12.2f}")
-    print("-" * 58)
-    print(f"{'MEAN ± STDDEV':<22} "
+        if j.get("fully_failed"):
+            print(f"{label:<24} {'—':>6} {'—':>6} {'—':>6} {'FAILED':>12}")
+        else:
+            print(f"{label:<24} "
+                  f"{j['mean_rel']:>6.2f} {j['mean_spec']:>6.2f} "
+                  f"{j['mean_act']:>6.2f} {j['mean_total']:>12.2f}")
+    print("-" * len(header))
+    print(f"{'MEAN ± STDDEV':<24} "
           f"{r['mean_rel_across_judges']:>6.2f} "
           f"{r['mean_spec_across_judges']:>6.2f} "
           f"{r['mean_act_across_judges']:>6.2f} "
           f"{r['mean_total_across_judges']:>7.2f} ± {r['stddev_total_across_judges']:.2f}")
+    print()
+
+    scoring = r.get("n_scoring_judges", len(r["judges"]))
+    panel = r.get("n_panel", len(r["judges"]))
+    print(f"Judges scoring: {scoring} / {panel} (panel)")
+    skipped_pre = r.get("skipped_preflight", [])
+    if skipped_pre:
+        print("Skipped pre-flight:")
+        for (m, reason) in skipped_pre:
+            print(f"  - {m}: {reason}")
+    failed = [j for j in r["judges"] if j.get("fully_failed")]
+    if failed:
+        print("Failed during run:")
+        for j in failed:
+            first = j["errors"][0] if j["errors"] else "(no error recorded)"
+            print(f"  - {j['model']}: {first[:140]}")
     print()
     print("Reference (April 2026, 12 judges averaged):")
     print("  Garden                                              24.05")
@@ -812,8 +1055,15 @@ def main() -> int:
                         "claude-sonnet-4-6, gpt-4o, gemini-2.5-pro). "
                         "Ignored when --cross-judge is set.")
     p.add_argument("--cross-judge", action="store_true",
-                   help="run Pulse hybrid once, score with all 4 judges, "
-                        "print aggregated table (implies --semantic)")
+                   help="run Pulse hybrid once, score with the full 12-judge "
+                        "panel (Anthropic Opus/Sonnet/Haiku, OpenAI "
+                        "GPT-4o/GPT-5-mini/GPT-4o-mini, Google Gemini "
+                        "Pro/Flash, xAI Grok-4, z.ai GLM-4.6, Qwen-Max, "
+                        "Moonshot Kimi-K2), print aggregated table "
+                        "(implies --semantic)")
+    p.add_argument("--json-out", type=Path, default=None,
+                   help="if set, dump the full cross-judge result as JSON "
+                        "to this path (structured capture for automation)")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args()
 
@@ -829,6 +1079,23 @@ def main() -> int:
             verbose=args.verbose,
         )
         _print_cross_judge_result(r)
+        if args.json_out:
+            # Drop per_test.memories (noisy object refs) before JSON dump.
+            slim = {
+                **r,
+                "judges": [
+                    {
+                        **j,
+                        "per_test": [
+                            {k: v for k, v in t.items() if k != "memories"}
+                            for t in j.get("per_test", [])
+                        ],
+                    }
+                    for j in r["judges"]
+                ],
+            }
+            args.json_out.write_text(json.dumps(slim, indent=2, default=str))
+            print(f"JSON result written to {args.json_out}")
         return 0
 
     if args.compare:
