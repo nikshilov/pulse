@@ -143,3 +143,27 @@ queries from chat-exports, re-run. Compare `Critical-hit` and
 - Not integrated with `~/dev/ai/bench/`. Intentionally local and cheap.
 - Not a regression gate for CI (yet). If we want that, pick a threshold on
   `Critical-hit` and fail the run below it.
+
+## Future: real-corpus evaluation
+
+The fixture in `scripts/bench/fixtures/` is synthetic — 18 hand-authored
+entities, 15 queries. Good for catching regressions in `_rank`, not a
+defensible comparison to external systems.
+
+A real-data corpus is prepared at
+`~/dev/ai/bench/datasets/empathic-memory-corpus.json` — 30 events from the
+"Alex" corpus used in the 9-way April 2026 empathic memory bench (Garden
+winner, 26.71). Each event carries `sentiment`, `sentiment_label`,
+`user_flag`, and `days_ago` — metadata that maps cleanly onto Pulse
+`entities` / `events` / `facts` after a short ETL pass:
+
+- `event.text` → observation → extraction (or direct seed)
+- `sentiment` / `sentiment_label` → `events.sentiment`
+- `user_flag` → candidate `entities.is_self` or `emotional_weight` signal
+- `days_ago` → `last_seen` relative to run-time
+
+The same file includes `tests` — held-out queries with ground-truth targets.
+Running Pulse retrieval on the corpus and scoring against those tests is the
+honest-comparison path to Garden. A separate branch is adding
+`run_real_eval.py` for this; the current harness stays fixture-based and
+deterministic.
