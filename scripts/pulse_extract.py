@@ -311,12 +311,51 @@ def _load_candidate_entities(
     return matched[:top_k]
 
 
+def _snapshot(
+    con: sqlite3.Connection,
+    obs_id: int,
+    op: str,
+    table_name: str,
+    row_id: int | None,
+    before: dict | None,
+    after: dict,
+) -> None:
+    """Log one graph mutation to graph_snapshots for reversibility.
+
+    Runs inside the caller's transaction/SAVEPOINT so it rolls back together
+    with the mutation it describes. Failure here is intentionally surfaced as
+    an exception — a mutation without a snapshot would defeat rewind, so we'd
+    rather the whole item roll back.
+    """
+    before_json = json.dumps(before, ensure_ascii=False) if before is not None else None
+    after_json = json.dumps(after, ensure_ascii=False)
+    con.execute(
+        "INSERT INTO graph_snapshots (observation_id, op, table_name, row_id, before_json, after_json) "
+        "VALUES (?,?,?,?,?,?)",
+        (obs_id, op, table_name, row_id, before_json, after_json),
+    )
+
+
+def _row_to_dict(con: sqlite3.Connection, table: str, row_id: int) -> dict | None:
+    """Fetch row as dict using column names from PRAGMA. Returns None if no row."""
+    cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
+    cur = con.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return dict(zip(cols, row))
+
+
 def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dict:
     """Apply one extraction result to the graph. Caller owns the outer transaction.
 
     Each item (entity/event/relation/fact) is wrapped in SAVEPOINT so an
     sqlite3.IntegrityError on one item does not abort the others. The caller's
     outer tx stays open on return.
+
+    Every mutation is mirrored into `graph_snapshots` within the same
+    SAVEPOINT so `pulse_rewind.py` can later reverse the effect of a single
+    observation without global backup/restore.
     """
     report = {
         "obs_id": obs_id,
@@ -343,10 +382,13 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
             dec = resolver.resolve_entity(ent, existing)
             scored = scorer.score_entity(ent)
             if dec.action == "bind_identity":
+                before = _row_to_dict(con, "entities", dec.entity_id)
                 con.execute(
                     "UPDATE entities SET last_seen=?, salience_score=?, emotional_weight=?, scorer_version=? WHERE id=?",
                     (now, scored["salience_score"], scored["emotional_weight"], scored["scorer_version"], dec.entity_id),
                 )
+                after = _row_to_dict(con, "entities", dec.entity_id)
+                _snapshot(con, obs_id, "update_entity", "entities", dec.entity_id, before, after)
                 entity_id = dec.entity_id
             else:
                 cur = con.execute(
@@ -355,24 +397,37 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
                      now, now, scored["salience_score"], scored["emotional_weight"], scored["scorer_version"], "v2"),
                 )
                 entity_id = cur.lastrowid
+                after = _row_to_dict(con, "entities", entity_id)
+                _snapshot(con, obs_id, "insert_entity", "entities", entity_id, None, after or {})
                 existing.append({"id": entity_id, "canonical_name": ent["canonical_name"], "kind": ent.get("kind", "person"), "aliases": ent.get("aliases") or []})
 
                 if dec.action == "proposal" and dec.entity_id:
-                    con.execute(
+                    cur2 = con.execute(
                         "INSERT INTO entity_merge_proposals (from_entity_id, to_entity_id, confidence, evidence_md, state, proposed_at) VALUES (?,?,?,?,?,?)",
                         (entity_id, dec.entity_id, dec.confidence, dec.reason, "pending", now),
                     )
+                    prop_id = cur2.lastrowid
+                    prop_after = _row_to_dict(con, "entity_merge_proposals", prop_id)
+                    _snapshot(con, obs_id, "insert_entity_merge_proposal",
+                              "entity_merge_proposals", prop_id, None, prop_after or {})
                 elif dec.action == "new_entity_with_question":
                     ttl = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 7 * 86400))
-                    con.execute(
+                    cur3 = con.execute(
                         "INSERT INTO open_questions (subject_entity_id, question_text, asked_at, ttl_expires_at, state) VALUES (?,?,?,?,?)",
                         (entity_id, f"Is {ent['canonical_name']} a new person, or an alias of someone I know?", now, ttl, "open"),
                     )
+                    q_id = cur3.lastrowid
+                    q_after = _row_to_dict(con, "open_questions", q_id)
+                    _snapshot(con, obs_id, "insert_open_question",
+                              "open_questions", q_id, None, q_after or {})
 
-            con.execute(
+            cur_ev = con.execute(
                 "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('entity',?,?,?)",
                 (entity_id, obs_id, now),
             )
+            ev_id = cur_ev.lastrowid
+            ev_after = _row_to_dict(con, "evidence", ev_id)
+            _snapshot(con, obs_id, "insert_evidence", "evidence", ev_id, None, ev_after or {})
             con.execute(f"RELEASE SAVEPOINT {sp}")
 
             name_to_id[ent["canonical_name"]] = entity_id
@@ -407,16 +462,26 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
                 (ev.get("title", ""), ev.get("description", ""), s["sentiment"], s["emotional_weight"], s["scorer_version"], ev.get("ts", now)),
             )
             event_id = cur.lastrowid
+            ev_row = _row_to_dict(con, "events", event_id)
+            _snapshot(con, obs_id, "insert_event", "events", event_id, None, ev_row or {})
             for ent_id in resolved_entity_ids:
-                con.execute(
+                cur_je = con.execute(
                     "INSERT OR IGNORE INTO event_entities (event_id, entity_id) VALUES (?, ?)",
                     (event_id, ent_id),
                 )
+                if cur_je.rowcount == 1:
+                    _snapshot(
+                        con, obs_id, "insert_event_entity", "event_entities",
+                        None, None, {"event_id": event_id, "entity_id": ent_id},
+                    )
                 report["event_entities_written"] += 1
-            con.execute(
+            cur_ev = con.execute(
                 "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('event',?,?,?)",
                 (event_id, obs_id, now),
             )
+            ev_evid_id = cur_ev.lastrowid
+            ev_evid_row = _row_to_dict(con, "evidence", ev_evid_id)
+            _snapshot(con, obs_id, "insert_evidence", "evidence", ev_evid_id, None, ev_evid_row or {})
             con.execute(f"RELEASE SAVEPOINT {sp}")
             report["events_written"] += 1
         except Exception as ex:
@@ -435,6 +500,15 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
         sp = f"rel_{idx}"
         con.execute(f"SAVEPOINT {sp}")
         try:
+            # Peek: does (from,to,kind) already exist? Determines insert vs update.
+            existing_row = con.execute(
+                "SELECT id FROM relations WHERE from_entity_id=? AND to_entity_id=? AND kind=?",
+                (from_id, to_id, rel.get("kind", "")),
+            ).fetchone()
+            before_row = None
+            if existing_row is not None:
+                before_row = _row_to_dict(con, "relations", existing_row[0])
+
             cur = con.execute(
                 """INSERT INTO relations (from_entity_id, to_entity_id, kind, strength, first_seen, last_seen, context)
                    VALUES (?,?,?,?,?,?,?)
@@ -444,10 +518,24 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
                        context   = COALESCE(excluded.context, context)""",
                 (from_id, to_id, rel.get("kind", ""), float(rel.get("strength", 0.0)), now, now, rel.get("context")),
             )
-            con.execute(
+            # cur.lastrowid is the row's id both for INSERT and for ON CONFLICT UPDATE
+            # paths (sqlite3 returns the upserted row's rowid).
+            rel_row_id = cur.lastrowid
+            after_row = _row_to_dict(con, "relations", rel_row_id)
+            if before_row is None:
+                _snapshot(con, obs_id, "insert_relation", "relations",
+                          rel_row_id, None, after_row or {})
+            else:
+                _snapshot(con, obs_id, "update_relation", "relations",
+                          rel_row_id, before_row, after_row or {})
+
+            cur_ev = con.execute(
                 "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('relation',?,?,?)",
-                (cur.lastrowid, obs_id, now),
+                (rel_row_id, obs_id, now),
             )
+            rel_evid_id = cur_ev.lastrowid
+            rel_evid_row = _row_to_dict(con, "evidence", rel_evid_id)
+            _snapshot(con, obs_id, "insert_evidence", "evidence", rel_evid_id, None, rel_evid_row or {})
             con.execute(f"RELEASE SAVEPOINT {sp}")
             report["relations_written"] += 1
         except Exception as ex:
@@ -473,11 +561,18 @@ def _apply_extraction(con: sqlite3.Connection, obs_id: int, result: dict) -> dic
                 (entity_id, fact.get("text", ""), scored["confidence"], scored["scorer_version"], obs_id, "v2", now),
             )
             if cur.rowcount == 1:
-                con.execute(
+                fact_id = cur.lastrowid
+                fact_row = _row_to_dict(con, "facts", fact_id)
+                _snapshot(con, obs_id, "insert_fact", "facts", fact_id, None, fact_row or {})
+                cur_ev = con.execute(
                     "INSERT INTO evidence (subject_kind, subject_id, observation_id, created_at) VALUES ('fact',?,?,?)",
-                    (cur.lastrowid, obs_id, now),
+                    (fact_id, obs_id, now),
                 )
+                fact_evid_id = cur_ev.lastrowid
+                fact_evid_row = _row_to_dict(con, "evidence", fact_evid_id)
+                _snapshot(con, obs_id, "insert_evidence", "evidence", fact_evid_id, None, fact_evid_row or {})
                 report["facts_written"] += 1
+            # else: ON CONFLICT DO NOTHING — fact was a duplicate; intentionally no snapshot
             con.execute(f"RELEASE SAVEPOINT {sp}")
         except Exception as ex:
             con.execute(f"ROLLBACK TO SAVEPOINT {sp}")
