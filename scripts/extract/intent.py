@@ -33,12 +33,15 @@ Schema (ordered by specificity — check more specific intents first):
 Rules are intentionally permissive. When in doubt, fall through to
 `cold_open` — the baseline formula works well there.
 
-TODO(intent-v2): add an optional LLM-based classifier as a fallback for
-ambiguous queries; keep rule-based as the fast path.
+An optional LLM-based classifier (`classify_intent_llm`) is also exposed
+as a safety net for queries the rules miss — indirect phrasing, irony,
+implicit intent, mixed-language — at ~$0.001/query (Sonnet tool-use).
+Rules remain the production default; the LLM backend is opt-in.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Literal
 
@@ -217,3 +220,124 @@ def classify_intent_rules(query: str) -> Intent:
         return "opener"
 
     return "cold_open"
+
+
+# ---------------------------------------------------------------------------
+# LLM-based classifier (opt-in safety net)
+# ---------------------------------------------------------------------------
+
+_VALID_INTENTS: tuple[str, ...] = (
+    "recent",
+    "weighs",
+    "anchor_family",
+    "opener",
+    "decoy_resist",
+    "cold_open",
+)
+
+INTENT_TOOL = {
+    "name": "classify_query_intent",
+    "description": (
+        "Classify the conversation query into one of 6 intents that drive "
+        "memory retrieval strategy"
+    ),
+    "input_schema": {
+        "type": "object",
+        "required": ["intent", "reason"],
+        "properties": {
+            "intent": {
+                "type": "string",
+                "enum": list(_VALID_INTENTS),
+                "description": (
+                    "One of the 6 intents. See the instruction prompt for "
+                    "disambiguation."
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "One short sentence naming which feature of the query "
+                    "drove the classification. For logging only."
+                ),
+            },
+        },
+    },
+}
+
+INTENT_CLASSIFIER_PROMPT = """\
+You classify conversational queries for a personal-AI-companion memory system.
+Your classification drives WHICH strategy the retriever uses to pick memories.
+
+Intents:
+- recent: query asks about freshness, recent events, "last week", "lately"
+  ("How's Alex these days?", "Что нового?", "What have you been up to?")
+- weighs: query asks what's heavy, hard, bothering, weighing emotionally
+  ("What's hard for Alex right now?", "Что тебя беспокоит?", "What weighs?")
+- anchor_family: query explicitly asks about family, relationships, parents
+  ("Tell me about Alex's mom", "Расскажи про его семью", "His brother?")
+- opener: casual greeting, general check-in, no specific topic
+  ("How are you?", "Hi", "Как дела?", "Привет")
+- decoy_resist: query asks for lightness / warmth / positive, hinting that
+  the retriever should DEMOTE grief anchors to preserve the mood. Tell-tale
+  words: warm, happy, fun, light, something nice; or "cheer up", "поддержи",
+  "что-нибудь хорошее".
+- cold_open: general "bring me into context" / "what's important" without
+  specific emotional direction. This is the DEFAULT. When uncertain, prefer
+  cold_open over guessing. Better to fall back to the flagged-first baseline
+  than to misroute to weighs or anchor_family.
+
+Call the classify_query_intent tool exactly once. Choose the single best intent.
+If two intents plausibly apply, pick the more specific one (e.g. anchor_family
+over opener).
+"""
+
+
+def classify_intent_llm(
+    query: str,
+    client=None,
+    model: str = "claude-sonnet-4-6",
+) -> Intent:
+    """LLM-based intent classifier using Claude Sonnet tool-use.
+
+    Accepts an optional `client` so tests can inject a mock. If `client` is
+    None, creates one from `ANTHROPIC_API_KEY`.
+
+    Uses strict tool-use (like triage in `pulse_extract.py`) so output is
+    enforced to the 6-intent enum — no parsing of free text, no hallucinated
+    intents.
+
+    Cost: ~$0.001 per query (Sonnet, ~400 in + 50 out tokens).
+
+    Raises:
+        RuntimeError: when `client` is None and `ANTHROPIC_API_KEY` is not
+            set, when the model does not call the classifier tool, or when
+            the returned intent is not in the enum (defence-in-depth in case
+            the SDK ever relaxes tool-schema enforcement).
+    """
+    if client is None:
+        import anthropic  # deferred import — keeps module light
+        key = os.getenv("ANTHROPIC_API_KEY")
+        if not key:
+            raise RuntimeError("ANTHROPIC_API_KEY required")
+        client = anthropic.Anthropic(api_key=key)
+
+    msg = client.messages.create(
+        model=model,
+        max_tokens=200,
+        system=INTENT_CLASSIFIER_PROMPT,
+        messages=[{"role": "user", "content": query}],
+        tools=[INTENT_TOOL],
+        tool_choice={"type": "tool", "name": "classify_query_intent"},
+    )
+    for block in msg.content:
+        if getattr(block, "type", None) == "tool_use" and (
+            getattr(block, "name", None) == "classify_query_intent"
+        ):
+            intent = block.input.get("intent") if isinstance(block.input, dict) else None
+            if intent not in _VALID_INTENTS:
+                raise RuntimeError(
+                    f"LLM returned invalid intent {intent!r}; "
+                    f"expected one of {_VALID_INTENTS}"
+                )
+            return intent  # type: ignore[return-value]
+    raise RuntimeError("LLM did not call the classifier tool")

@@ -280,3 +280,59 @@ moved.
   finite metrics
 
 Tests skip cleanly when the corpus JSON is not present on disk.
+
+## Intent classifier backends
+
+`run_llm_judge.py` supports two intent classifiers via `--intent-classifier`:
+
+- `rules` (default) — fast, deterministic, zero API cost.
+  Defined in `scripts/extract/intent.py::classify_intent_rules`.
+- `llm` — Claude Sonnet tool-use, ~$0.001 per query.
+  Defined in `scripts/extract/intent.py::classify_intent_llm`.
+
+### Agreement on 5 corpus queries (2026-04-17)
+
+| # | test id | query (trunc) | rules | llm | agree? |
+|---|---------|---------------|-------|-----|--------|
+| 1 | T1 | What is currently most important for Alex? Bring me into con… | cold_open | cold_open | YES |
+| 2 | T2 | I want to ask Alex about his family this weekend. What shoul… | anchor_family | anchor_family | YES |
+| 3 | T3 | What is currently weighing on Alex emotionally? | weighs | weighs | YES |
+| 4 | T4 | What has happened in Alex's life recently that I should know… | recent | recent | YES |
+| 5 | T5 | Tell me about Alex's mom. | anchor_family | anchor_family | YES |
+
+Agreement: **5/5**. Expected — the corpus test queries were written in the
+language the rules already match (family tokens, "weighing", "recently",
+etc.). The LLM is a safety net for drift, not an improvement on known data.
+
+### Bench delta (--semantic, Opus judge, 2026-04-17)
+
+|                | rules  | llm    | delta |
+|----------------|--------|--------|-------|
+| Relevance      | 7.20   | 7.20   |  0.00 |
+| Specificity    | 8.60   | 8.40   | -0.20 |
+| Actionability  | 7.60   | 7.40   | -0.20 |
+| **TOTAL**      | **23.40** | **23.00** | **-0.40** |
+
+The retrieval was identical (same entity ids, same intents per test), so the
+0.40 delta is judge-sampling noise on the Opus rubric, not a classifier
+regression. Confirmed negative result: on the corpus the LLM classifier
+adds cost without changing retrieval.
+
+### Cost
+
+- Per query: ~$0.001 (Sonnet 4.6, ~400 in + 50 out tokens, tool-use).
+- Per bench run (5 tests): ~$0.005 classifier + $0.30 judge.
+
+### When to use which
+
+- **Rules (default)** — production retrieval hot path; local dev; any
+  case where latency or API budget matters. Perfect on the current corpus.
+- **LLM (opt-in)** — offline analysis of real Nik-queries with indirect
+  phrasing, irony, mixed Russian/English, or emotional subtext outside the
+  rule keywords. Safety net for unseen drift. Wire into production only
+  after real-query audit shows rules-misses.
+
+### Ship decision
+
+Rules remains the default. LLM is opt-in via `--intent-classifier llm`.
+Not wired into `retrieval.py`; that's a separate branch.
