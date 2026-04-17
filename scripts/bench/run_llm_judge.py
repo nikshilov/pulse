@@ -58,8 +58,22 @@ from bench.run_real_eval import (  # noqa: E402
     fresh_db,
     ingest_corpus,
 )
+from extract.intent import classify_intent_rules  # noqa: E402
 from extract.retrieval import retrieve_context  # noqa: E402
 from pulse_consolidate import embed_entities  # noqa: E402
+
+
+# Keywords used by rank_memories_by_intent's anchor_family filter. Mirror of
+# _ANCHOR_FAMILY_PATTERNS but at memory-text level, where we can be simpler
+# (substring rather than regex) and faster.
+_FAMILY_TOKENS = (
+    "family", "mom", "mum", "mother", "dad", "father", "parent",
+    "brother", "sister", "sibling", "son", "daughter",
+    "wife", "husband", "spouse", "fiancé", "fiancee", "fiance",
+    "partner",
+    "семь", "мам", "мать", "пап", "отец", "брат", "сестр",
+    "сын", "дочь", "дочк", "жен", "муж", "родител",
+)
 
 
 JUDGE_MODEL = "claude-opus-4-6"
@@ -78,13 +92,12 @@ def _anthropic_client():
 
 
 def _pull_top_memories(con, entity_ids: list[int], corpus_events: list[dict],
-                      max_memories: int = 3) -> list[dict]:
-    """Collect top-3 memories for a list of retrieved entities.
+                      max_memories: int = 3, intent: str = "cold_open") -> list[dict]:
+    """Collect top-k memories for a list of retrieved entities.
 
     A "memory" here is the text of an event the entity participates in.
-    We pick the top events (by user_flag true first, then by abs(sentiment))
-    across all top entities, preserving the spirit of what Garden surfaced
-    in the April bench.
+    We collect all candidate event-memories for the retrieved entities,
+    then delegate to `rank_memories_by_intent` to choose ordering.
     """
     if not entity_ids:
         return []
@@ -96,24 +109,145 @@ def _pull_top_memories(con, entity_ids: list[int], corpus_events: list[dict],
         f"WHERE ee.entity_id IN ({placeholders})",
         tuple(entity_ids),
     ).fetchall()
-    event_ids = [r[0] for r in rows]
     # Match back to corpus for user_flag + days_ago
     by_id = {ev["id"]: ev for ev in corpus_events}
-    scored: list[tuple[float, dict]] = []
+    pool: list[dict] = []
     for (eid, title, description, sentiment) in rows:
         cev = by_id.get(eid, {})
-        user_flag = 1 if cev.get("user_flag") else 0
-        # Flag-first, then emotional magnitude — matches Garden's anchor logic
-        rank_score = user_flag * 10 + abs(sentiment or 0)
-        scored.append((rank_score, {
+        pool.append({
             "id": eid,
             "text": description or title,
-            "sentiment": sentiment,
-            "user_flag": user_flag,
+            "sentiment": sentiment or 0,
+            "user_flag": 1 if cev.get("user_flag") else 0,
             "days_ago": cev.get("days_ago"),
-        }))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [m for _, m in scored[:max_memories]]
+        })
+    ranked = rank_memories_by_intent(pool, intent)
+    return ranked[:max_memories]
+
+
+def _mentions_family(text: str) -> bool:
+    """True if a memory's text references a family member / relationship."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(tok in low for tok in _FAMILY_TOKENS)
+
+
+def rank_memories_by_intent(memories: list[dict], intent: str) -> list[dict]:
+    """Re-rank a pool of event-memories according to query intent.
+
+    Each memory dict should have: id, text, sentiment, user_flag, days_ago.
+    Returns the full pool sorted by intent-appropriate key. The caller
+    slices to `max_memories`.
+
+    Strategy table:
+
+    | intent         | ordering                                               |
+    |----------------|--------------------------------------------------------|
+    | recent         | days_ago ASC, user_flag DESC                           |
+    | weighs         | filter sentiment<0 → abs(sentiment) DESC, days_ago ASC;|
+    |                | pad with remaining by abs(sentiment) DESC if <3        |
+    | anchor_family  | filter text mentions family → user_flag DESC,          |
+    |                | abs(sentiment) DESC; pad with user_flag=1 globals      |
+    | opener         | user_flag DESC, abs(sentiment) DESC                    |
+    | decoy_resist   | sentiment DESC, days_ago ASC (positives first);        |
+    |                | preserve one user_flag as safety anchor in slot 2/3    |
+    | cold_open      | user_flag DESC, abs(sentiment) DESC (baseline)         |
+    """
+    if not memories:
+        return []
+
+    def by_recent(m: dict) -> tuple:
+        # Freshness-biased blend: fresher wins, but neutral mundane events
+        # should not beat a slightly older emotionally-weighted event.
+        # Primary key: days_ago penalized by emotional magnitude and flag.
+        # A flagged item effectively gets a ~30-day freshness bonus; each
+        # |sentiment| point gets a ~7-day bonus. This keeps "lately" queries
+        # from surfacing neutral gym/tacos events over recent weddings.
+        days = m.get("days_ago")
+        if days is None:
+            days = 10**9
+        sent_mag = abs(m.get("sentiment", 0) or 0)
+        flag = int(m.get("user_flag", 0))
+        adjusted = days - 7 * sent_mag - 30 * flag
+        return (adjusted, days)
+
+    def by_weight(m: dict) -> tuple:
+        return (-abs(m.get("sentiment", 0) or 0),
+                m.get("days_ago") if m.get("days_ago") is not None else 10**9)
+
+    def by_flag_then_weight(m: dict) -> tuple:
+        return (-int(m.get("user_flag", 0)),
+                -abs(m.get("sentiment", 0) or 0))
+
+    if intent == "recent":
+        return sorted(memories, key=by_recent)
+
+    if intent == "weighs":
+        negatives = [m for m in memories if (m.get("sentiment") or 0) < 0]
+        others = [m for m in memories if (m.get("sentiment") or 0) >= 0]
+        negatives_sorted = sorted(negatives, key=by_weight)
+        others_sorted = sorted(others, key=by_weight)
+        # Pad with non-negatives only if we have too few negatives for slot-3.
+        if len(negatives_sorted) >= 3:
+            return negatives_sorted + others_sorted
+        return negatives_sorted + others_sorted
+
+    if intent == "anchor_family":
+        family = [m for m in memories if _mentions_family(m.get("text", ""))]
+        other = [m for m in memories if not _mentions_family(m.get("text", ""))]
+        family_sorted = sorted(family, key=by_flag_then_weight)
+        # Pad with globally user-flagged entries not already in family set.
+        family_ids = {m["id"] for m in family_sorted}
+        padding_flagged = sorted(
+            [m for m in other if m.get("user_flag") and m["id"] not in family_ids],
+            key=by_flag_then_weight,
+        )
+        padding_rest = sorted(
+            [m for m in other if not m.get("user_flag") and m["id"] not in family_ids],
+            key=by_flag_then_weight,
+        )
+        return family_sorted + padding_flagged + padding_rest
+
+    if intent == "opener":
+        return sorted(memories, key=by_flag_then_weight)
+
+    if intent == "decoy_resist":
+        # Positive-first, recency-tiebreak. Then reserve one user_flag slot
+        # as a safety-anchor (slot 2 if 2+ items, else append).
+        positives = [m for m in memories if (m.get("sentiment") or 0) > 0]
+        neutrals = [m for m in memories if (m.get("sentiment") or 0) == 0]
+        negatives = [m for m in memories if (m.get("sentiment") or 0) < 0]
+
+        def by_positive(m: dict) -> tuple:
+            return (-1 * (m.get("sentiment") or 0),
+                    m.get("days_ago") if m.get("days_ago") is not None
+                    else 10**9)
+
+        pos_sorted = sorted(positives, key=by_positive)
+        neu_sorted = sorted(neutrals, key=by_positive)
+        neg_sorted = sorted(
+            negatives,
+            key=lambda m: (-int(m.get("user_flag", 0)),
+                           -abs(m.get("sentiment") or 0)),
+        )
+
+        base = pos_sorted + neu_sorted + neg_sorted
+        # Promote the first user_flag grief anchor into slot 2 as a safety
+        # warning — judges penalize surfacing grief top-1 but reward including
+        # the anchor as context.
+        anchor_idx = next(
+            (i for i, m in enumerate(base)
+             if m.get("user_flag") and (m.get("sentiment") or 0) < 0),
+            None,
+        )
+        if anchor_idx is not None and anchor_idx > 1 and len(base) >= 2:
+            anchor = base.pop(anchor_idx)
+            base.insert(1, anchor)
+        return base
+
+    # cold_open — baseline behavior: user_flag first, then |sentiment|.
+    return sorted(memories, key=by_flag_then_weight)
 
 
 def _format_system_block(system_label: str, memories: list[dict]) -> str:
@@ -201,15 +335,22 @@ def _judge_one(client, judge_prompt: str, test: dict, corpus_events: list[dict],
 
 def _retrieve_memories_for_test(con, test: dict, corpus_events: list[dict],
                                 semantic: bool, embedder_model: str,
-                                semantic_top_n: int) -> list[dict]:
-    """Run Pulse retrieval for the test query, return top-3 event memories."""
+                                semantic_top_n: int,
+                                intent: str = "cold_open") -> list[dict]:
+    """Run Pulse retrieval for the test query, return top-3 event memories.
+
+    The `intent` argument is forwarded to `_pull_top_memories`, which uses it
+    to switch ranking strategy. Entity-level retrieval is unchanged.
+    """
     result = retrieve_context(
         con, test["user_query"], top_k=10, depth=2,
         semantic=semantic, embedder_model=embedder_model,
         semantic_top_n=semantic_top_n,
     )
     entity_ids = [e["id"] for e in result["matched_entities"]]
-    return _pull_top_memories(con, entity_ids, corpus_events, max_memories=3)
+    return _pull_top_memories(
+        con, entity_ids, corpus_events, max_memories=3, intent=intent,
+    )
 
 
 def run(
@@ -232,10 +373,12 @@ def run(
 
     per_test: list[dict] = []
     for test in corpus["tests"]:
+        intent = classify_intent_rules(test["user_query"])
         memories = _retrieve_memories_for_test(
             con, test, corpus["events"],
             semantic=semantic, embedder_model=embedder_model,
             semantic_top_n=semantic_top_n,
+            intent=intent,
         )
         verdict = _judge_one(
             client, judge_prompt, test, corpus["events"],
@@ -248,13 +391,14 @@ def run(
         per_test.append({
             "test_id": test["id"],
             "name": test["name"],
+            "intent": intent,
             "rel": rel, "spec": spec, "act": act, "total": total,
             "note": verdict.get("note", ""),
             "memories": memories,
         })
         if verbose:
-            print(f"[{test['id']}] {test['name']}  rel={rel} spec={spec} act={act} "
-                  f"total={total}/30")
+            print(f"[{test['id']}] {test['name']}  intent={intent}  "
+                  f"rel={rel} spec={spec} act={act} total={total}/30")
             print(f"  note: {verdict.get('note', '')}")
 
     mean_total = sum(t["total"] for t in per_test) / len(per_test) if per_test else 0

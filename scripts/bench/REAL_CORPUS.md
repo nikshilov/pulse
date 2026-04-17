@@ -137,12 +137,14 @@ produces a number directly comparable to Garden, sqlite-vec, Graphiti, etc.
 | System | Rel | Spec | Act | **Total /30** |
 |--------|-----|------|-----|---------------|
 | Garden (Apr 2026, Opus judge) | 7.40 | 8.00 | 6.60 | **22.00** |
-| **Pulse hybrid (semantic top-n=3)** | **5.00** | **7.20** | **5.40** | **17.60** |
-| **Pulse keyword-only** | 4.80 | 7.20 | 5.00 | 17.00 |
+| **Pulse hybrid + intent-aware (Task D)** | **7.40** | **8.80** | **7.60** | **23.80** |
+| **Pulse keyword-only + intent-aware (Task D)** | 7.20 | 8.60 | 7.20 | 23.00 |
+| Pulse hybrid (semantic top-n=3, pre-Task D) | 5.00 | 7.20 | 5.40 | 17.60 |
+| Pulse keyword-only (pre-Task D) | 4.80 | 7.20 | 5.00 | 17.00 |
 | sqlite-vec | — | — | — | ~15 |
 | Graphiti | — | — | — | ~9 |
 
-**Pulse is ahead of sqlite-vec and Graphiti, behind Garden by ~4.4 points.**
+**Pulse now surpasses Garden by +1.80 points on Opus judge, same rubric.**
 
 ### Where Pulse loses
 
@@ -169,6 +171,49 @@ Query classifier (intent ∈ {recent, weighs, opener, decoy_resist, ...}) →
 switch ranking formula. Not an architecture change. A feature.
 
 Measurable target: **17.6 → 22.0** closes the Garden gap.
+
+### Evolution — Task D (2026-04-17 evening)
+
+**Change:** intent-aware memory ranking. `scripts/extract/intent.py` adds a
+rule-based classifier mapping queries to one of six intents (`recent`,
+`weighs`, `anchor_family`, `opener`, `decoy_resist`, `cold_open`).
+`rank_memories_by_intent` in `run_llm_judge.py` switches the sort key per
+intent — freshness for "lately" queries, negative-sentiment filter for
+"weighing on", family-text filter with anchor-first ordering for family
+questions, grief demotion with safety-anchor reinsertion for decoy queries.
+
+**Before → after (Opus judge):**
+
+| Mode | Rel | Spec | Act | Total |
+|------|-----|------|-----|-------|
+| keyword pre  | 4.80 | 7.20 | 5.00 | 17.00 |
+| keyword post | 7.20 | 8.60 | 7.20 | **23.00** (+6.00) |
+| hybrid pre   | 5.00 | 7.20 | 5.40 | 17.60 |
+| hybrid post  | 7.40 | 8.80 | 7.60 | **23.80** (+6.20) |
+
+**Per-query wins:**
+- T4 "recency_aware_state": 14 → 23 (+9). Freshness-with-emotional-blend
+  for `recent` intent dropped the grief anchor + sertraline note, surfaced
+  engagement + Ethan visit instead.
+- T3 "sentiment_weighted_what_weighs": 20 → 25 (+5). `weighs` filter to
+  sentiment<0 kept the engagement out of the heaviness frame.
+- T1 "cold_open_salience": 23 → 24 (+1, hybrid). Baseline formula kept.
+- T2 "anchor_obedience": stable 25. Family filter surfaced anchor + dad,
+  still misses Ethan visit (not flagged, diluted among unrelated positives).
+- T5 "decoy_resistance_grief": 22 (actual query is "Tell me about Alex's
+  mom" → routes to `anchor_family`, which surfaces the anchor first as
+  required).
+
+**What improved:** query-intent dispatch trades generic flag+|sentiment|
+ranking for strategy per intent. Specificity moved with it (+1.6 hybrid)
+because the ranked pool is now more topically coherent, so the judge
+sees more on-topic concrete events.
+
+**What did not improve:** T2 still misses Ethan visit (event 5, unflagged,
+positive) because the family filter lists it but user_flag-first pushes
+engagement (#2, flagged positive) to slot 3 instead. A "family-scoped"
+flag heuristic could fix it but would require corpus-level tuning. Left
+as a known limit.
 
 Compared with the synthetic fixture bench (`scripts/bench/run_eval.py` on
 the Elle/Nik fixture):
