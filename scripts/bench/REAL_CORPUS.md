@@ -128,6 +128,48 @@ doc) produced:
 
 Cumulative delta since morning: Crit@1 **+0.800**, MRR **+0.467**, R@5 **+0.067**, R@10 **+0.067**.
 
+## Garden-comparable LLM-judge result (Task C, 2026-04-17 evening)
+
+Ran `scripts/bench/run_llm_judge.py --compare` — uses the SAME rubric and
+SAME judge (Opus 4.6) as the April bench where Garden scored 22.00. This
+produces a number directly comparable to Garden, sqlite-vec, Graphiti, etc.
+
+| System | Rel | Spec | Act | **Total /30** |
+|--------|-----|------|-----|---------------|
+| Garden (Apr 2026, Opus judge) | 7.40 | 8.00 | 6.60 | **22.00** |
+| **Pulse hybrid (semantic top-n=3)** | **5.00** | **7.20** | **5.40** | **17.60** |
+| **Pulse keyword-only** | 4.80 | 7.20 | 5.00 | 17.00 |
+| sqlite-vec | — | — | — | ~15 |
+| Graphiti | — | — | — | ~9 |
+
+**Pulse is ahead of sqlite-vec and Graphiti, behind Garden by ~4.4 points.**
+
+### Where Pulse loses
+
+- **Specificity: 7.20** ≈ Garden (8.00). Concrete event_ids, texts, dates — near parity.
+- **Relevance: 5.00** vs Garden's 7.40 — the main gap. Pulse's
+  `_pull_top_memories` ranks events by `user_flag + |sentiment|` uniformly
+  for all query types. Garden uses different strategies per query intent
+  (recency for "what's recent", anchor for "what weighs", etc.).
+- **Actionability: 5.40** — downstream of relevance.
+
+Concrete failures from judge notes:
+- T4 "recency_aware_state": Pulse returned a 365-day-old grief landmine +
+  confidential sertraline note for a "what's going on lately?" query.
+  Time-blind.
+- T3 "sentiment_weighted_what_weighs": Pulse surfaced the engagement
+  (positive, explicit failure mode) when asked what's heavy. Sentiment-blind.
+- T2 "anchor_obedience": mom-grief anchor top (✓), but missed dad-landmine
+  (#24) and safe Ethan opener (#5).
+
+### The closeable gap
+
+Pulse + query-intent-aware ranking is the credible path to Garden-tier.
+Query classifier (intent ∈ {recent, weighs, opener, decoy_resist, ...}) →
+switch ranking formula. Not an architecture change. A feature.
+
+Measurable target: **17.6 → 22.0** closes the Garden gap.
+
 Compared with the synthetic fixture bench (`scripts/bench/run_eval.py` on
 the Elle/Nik fixture):
 
