@@ -58,7 +58,10 @@ from bench.run_real_eval import (  # noqa: E402
     fresh_db,
     ingest_corpus,
 )
-from extract.intent import classify_intent_rules  # noqa: E402
+from extract.intent import (  # noqa: E402
+    classify_intent_llm,
+    classify_intent_rules,
+)
 from extract.retrieval import retrieve_context  # noqa: E402
 from pulse_consolidate import embed_entities  # noqa: E402
 
@@ -353,12 +356,31 @@ def _retrieve_memories_for_test(con, test: dict, corpus_events: list[dict],
     )
 
 
+def _get_intent_classifier(name: str):
+    """Return a callable `(query) -> Intent` for the chosen backend.
+
+    Supported backends:
+      - "rules" (default): fast, deterministic, no API calls.
+      - "llm": Claude Sonnet tool-use classifier; ~$0.001/query. Shares the
+        same Anthropic client factory as the judge — if ANTHROPIC_API_KEY is
+        missing, `classify_intent_llm` itself raises.
+    """
+    if name == "rules":
+        return classify_intent_rules
+    if name == "llm":
+        return classify_intent_llm
+    raise ValueError(
+        f"unknown intent classifier {name!r}; expected 'rules' or 'llm'"
+    )
+
+
 def run(
     corpus_path: Path = DEFAULT_CORPUS_PATH,
     semantic: bool = False,
     embedder_model: str = "openai-text-embedding-3-large",
     semantic_top_n: int = 3,
     verbose: bool = False,
+    intent_classifier: str = "rules",
 ) -> dict:
     corpus = json.loads(Path(corpus_path).read_text())
     con = fresh_db()
@@ -369,11 +391,12 @@ def run(
     judge_prompt = JUDGE_PROMPT_PATH.read_text()
     client = _anthropic_client()
     mode = "hybrid" if semantic else "keyword"
-    system_label = f"System 01 (Pulse {mode})"
+    system_label = f"System 01 (Pulse {mode}, intent={intent_classifier})"
+    classify = _get_intent_classifier(intent_classifier)
 
     per_test: list[dict] = []
     for test in corpus["tests"]:
-        intent = classify_intent_rules(test["user_query"])
+        intent = classify(test["user_query"])
         memories = _retrieve_memories_for_test(
             con, test, corpus["events"],
             semantic=semantic, embedder_model=embedder_model,
@@ -446,6 +469,17 @@ def main() -> int:
     p.add_argument("--semantic-top-n", type=int, default=3)
     p.add_argument("--compare", action="store_true",
                    help="run both keyword and hybrid, print side-by-side")
+    p.add_argument(
+        "--intent-classifier",
+        default="rules",
+        choices=["rules", "llm"],
+        help=(
+            "which intent classifier to use per test query. "
+            "'rules' (default): fast, deterministic, zero API cost. "
+            "'llm': Claude Sonnet tool-use, ~$0.001/query — safety net for "
+            "queries the rules miss (indirect phrasing, irony, mixed lang)."
+        ),
+    )
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args()
 
@@ -455,13 +489,22 @@ def main() -> int:
 
     if args.compare:
         print(">>> KEYWORD")
-        kw = run(corpus_path=args.corpus, semantic=False, verbose=args.verbose)
+        kw = run(
+            corpus_path=args.corpus,
+            semantic=False,
+            verbose=args.verbose,
+            intent_classifier=args.intent_classifier,
+        )
         _print_result(kw)
         print(">>> HYBRID")
-        hy = run(corpus_path=args.corpus, semantic=True,
-                 embedder_model=args.embedder_model,
-                 semantic_top_n=args.semantic_top_n,
-                 verbose=args.verbose)
+        hy = run(
+            corpus_path=args.corpus,
+            semantic=True,
+            embedder_model=args.embedder_model,
+            semantic_top_n=args.semantic_top_n,
+            verbose=args.verbose,
+            intent_classifier=args.intent_classifier,
+        )
         _print_result(hy)
         print("=" * 78)
         print("DELTA:  hybrid − keyword")
@@ -483,6 +526,7 @@ def main() -> int:
         embedder_model=args.embedder_model,
         semantic_top_n=args.semantic_top_n,
         verbose=args.verbose,
+        intent_classifier=args.intent_classifier,
     )
     _print_result(r)
     return 0

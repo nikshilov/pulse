@@ -1,15 +1,21 @@
-"""Tests for `extract.intent.classify_intent_rules`.
+"""Tests for `extract.intent.classify_intent_rules` and `classify_intent_llm`.
 
 Covers the 6 intent labels across English and Russian, edge cases
 (empty / whitespace), ordering guarantees (decoy_resist > anchor_family,
 weighs > recent), and — crucially — the 5 actual queries in the
 empathic-memory-corpus that the LLM-judge bench uses.
+
+The LLM classifier tests are mock-only — no live Anthropic calls. We
+assert happy-path tool-use, missing-key error, no-tool-call error, and
+the defence-in-depth guard against enum-violating inputs.
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 _HERE = Path(__file__).resolve().parent
 _SCRIPTS = _HERE.parent
@@ -18,7 +24,10 @@ if str(_SCRIPTS) not in sys.path:
 
 import pytest  # noqa: E402
 
-from extract.intent import classify_intent_rules  # noqa: E402
+from extract.intent import (  # noqa: E402
+    classify_intent_llm,
+    classify_intent_rules,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -191,3 +200,82 @@ def test_corpus_queries_classification(query, expected):
     resist semantics, but the rule-based path is sufficient for the bench.
     """
     assert classify_intent_rules(query) == expected
+
+
+# ---------------------------------------------------------------------------
+# LLM classifier — mock-only (no live API calls)
+# ---------------------------------------------------------------------------
+
+def _mock_tool_use_block(intent: str, reason: str = "test"):
+    """Build a mock tool_use content block matching anthropic SDK shape."""
+    return SimpleNamespace(
+        type="tool_use",
+        name="classify_query_intent",
+        input={"intent": intent, "reason": reason},
+    )
+
+
+def _mock_text_block(text: str):
+    return SimpleNamespace(type="text", text=text)
+
+
+def _mock_client_returning(content_blocks):
+    """Build a mock Anthropic client whose messages.create returns the given blocks."""
+    client = MagicMock()
+    client.messages.create.return_value = SimpleNamespace(content=content_blocks)
+    return client
+
+
+def test_classify_intent_llm_tool_use_happy_path():
+    """Mock tool_use returns 'recent' for a recency query."""
+    client = _mock_client_returning([
+        _mock_tool_use_block("recent", reason="asks about 'these days'"),
+    ])
+    result = classify_intent_llm("How's Alex these days?", client=client)
+    assert result == "recent"
+    # Ensure the SDK was called with the expected tool-choice shape.
+    args, kwargs = client.messages.create.call_args
+    assert kwargs["tool_choice"] == {
+        "type": "tool", "name": "classify_query_intent",
+    }
+    assert kwargs["tools"][0]["name"] == "classify_query_intent"
+
+
+def test_classify_intent_llm_no_key_raises(monkeypatch):
+    """No client, no ANTHROPIC_API_KEY in env → RuntimeError."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+        classify_intent_llm("anything", client=None)
+
+
+def test_classify_intent_llm_no_tool_call_raises():
+    """Model returned text only (no tool_use block) → RuntimeError."""
+    client = _mock_client_returning([
+        _mock_text_block("I think this is a recent query."),
+    ])
+    with pytest.raises(RuntimeError, match="did not call the classifier tool"):
+        classify_intent_llm("anything", client=client)
+
+
+def test_classify_intent_llm_invalid_intent_raises():
+    """Tool-use with a value outside the enum → RuntimeError (defence-in-depth).
+
+    Tool-use schema enforcement should make this impossible in production,
+    but if the SDK ever relaxes that contract, we fail loud rather than
+    silently accepting a hallucinated intent.
+    """
+    client = _mock_client_returning([
+        _mock_tool_use_block("urgent", reason="not a real intent"),
+    ])
+    with pytest.raises(RuntimeError, match="invalid intent"):
+        classify_intent_llm("anything", client=client)
+
+
+def test_classify_intent_llm_all_valid_enum_values():
+    """Sanity — each of the 6 valid intents round-trips through the mock."""
+    for intent in (
+        "recent", "weighs", "anchor_family",
+        "opener", "decoy_resist", "cold_open",
+    ):
+        client = _mock_client_returning([_mock_tool_use_block(intent)])
+        assert classify_intent_llm("q", client=client) == intent
