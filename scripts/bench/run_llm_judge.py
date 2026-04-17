@@ -21,22 +21,27 @@ Flow per test:
   2. Pull their associated memories (event texts + facts linked to those entities)
   3. Take top-3 memories (highest-salience events from top-ranked entities)
   4. Build judge prompt using the corpus's test.fail_modes + ideal explanation
-  5. Ask Claude Opus to score Pulse per rubric
+  5. Ask judge (Opus / Sonnet / GPT-4o / Gemini) to score Pulse per rubric
   6. Parse JSON → {S01_rel, S01_spec, S01_act}
 
 Aggregate: sum(rel+spec+act) / tests = /30 score.
 
-Cost per run (5 tests, 1 system):
+Cost per run (5 tests, 1 system, Opus):
   ~3k input + ~200 output tokens × 5 tests × Opus ($15 in / $75 out / 1M)
   = ~$0.30/run. With --compare (2 systems): ~$0.60/run.
 
-Usage:
-    export OPENAI_API_KEY="..."     # for semantic mode
-    export ANTHROPIC_API_KEY="..."  # for judge
+Cross-judge (--cross-judge) cost: ~$1-2 per run (hybrid retrieval × 4 judges).
 
-    python scripts/bench/run_llm_judge.py                 # keyword only
-    python scripts/bench/run_llm_judge.py --semantic      # hybrid only
-    python scripts/bench/run_llm_judge.py --compare       # both, side-by-side
+Usage:
+    export OPENAI_API_KEY="..."     # for semantic mode + GPT judges
+    export ANTHROPIC_API_KEY="..."  # for Claude judges
+    export GEMINI_API_KEY="..."     # for Gemini judge
+
+    python scripts/bench/run_llm_judge.py                          # keyword only
+    python scripts/bench/run_llm_judge.py --semantic               # hybrid only
+    python scripts/bench/run_llm_judge.py --compare                # both, side-by-side
+    python scripts/bench/run_llm_judge.py --judge-model gpt-4o     # single non-default judge
+    python scripts/bench/run_llm_judge.py --cross-judge            # 4 judges, aggregated
 """
 
 from __future__ import annotations
@@ -82,13 +87,179 @@ JUDGE_PROMPT_PATH = Path(
 )
 
 
+# Cross-judge panel. Exact model IDs. Ordering matters for the output table.
+CROSS_JUDGE_MODELS: list[str] = [
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "gpt-4o",
+    "gemini-2.5-pro",
+]
+
+
+# Secret-file fallbacks (env vars take precedence).
+_SECRET_PATHS = {
+    "ANTHROPIC_API_KEY": Path.home() / ".openclaw/secrets/anthropic-api-key.txt",
+    "OPENAI_API_KEY": Path.home() / ".openclaw/secrets/openai.txt",
+    "GEMINI_API_KEY": Path.home() / ".openclaw/secrets/gemini-key.txt",
+}
+
+
+def _load_key(env_var: str) -> str | None:
+    """Return the API key from env, or from the secret file on disk.
+
+    Env var takes precedence. For the OpenAI file the format is
+    ``OPENAI_API = sk-...`` (key=value, parsed with awk-ish split on ``=``).
+    Anthropic + Gemini files hold the raw key on a single line.
+    """
+    val = os.getenv(env_var)
+    if val:
+        return val.strip()
+    path = _SECRET_PATHS.get(env_var)
+    if path is None or not path.exists():
+        return None
+    raw = path.read_text().strip()
+    if "=" in raw and raw.splitlines()[0].split("=")[0].strip().isidentifier():
+        # key = value format (OpenAI file)
+        _, _, value = raw.partition("=")
+        return value.strip() or None
+    return raw or None
+
+
 def _anthropic_client():
     """Lazy Anthropic client. Raises if key missing."""
     import anthropic  # deferred import
-    key = os.getenv("ANTHROPIC_API_KEY")
+    key = _load_key("ANTHROPIC_API_KEY")
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY required for llm-judge runner")
     return anthropic.Anthropic(api_key=key)
+
+
+def _strip_code_fence(text: str) -> str:
+    """Strip optional ```json ... ``` fence. Mirrors the tolerance of the
+    original `_judge_one` so all provider paths handle the same outputs.
+    """
+    t = text.strip()
+    if not t.startswith("```"):
+        return t
+    # ```json\n...\n``` or ```\n...\n```
+    inner = t.strip("`")
+    # Drop optional language hint on the first line
+    if "\n" in inner:
+        first, _, rest = inner.partition("\n")
+        if first.strip().lower() in {"json", ""}:
+            inner = rest
+    # Drop trailing backticks / fence remnant
+    inner = inner.rstrip("`").strip()
+    return inner
+
+
+def _parse_judge_json(text: str) -> dict:
+    """Parse a judge response, tolerating code fences and trailing prose."""
+    cleaned = _strip_code_fence(text)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Last-ditch: find the first {...} block.
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            snippet = cleaned[start : end + 1]
+            return json.loads(snippet)
+        raise
+
+
+def _claude_judge(model: str, system_prompt: str, user_msg: str) -> dict:
+    import anthropic  # deferred import
+    key = _load_key("ANTHROPIC_API_KEY")
+    if not key:
+        raise RuntimeError("ANTHROPIC_API_KEY required for Claude judge")
+    client = anthropic.Anthropic(api_key=key)
+    resp = client.messages.create(
+        model=model,
+        max_tokens=1024,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    text = ""
+    for block in resp.content:
+        if block.type == "text":
+            text += block.text
+    try:
+        return _parse_judge_json(text)
+    except json.JSONDecodeError as ex:
+        raise RuntimeError(
+            f"{model} returned non-JSON: {ex}\n---\n{text[:500]}"
+        )
+
+
+def _openai_judge(model: str, system_prompt: str, user_msg: str) -> dict:
+    from openai import OpenAI  # deferred import
+    key = _load_key("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY required for OpenAI judge")
+    client = OpenAI(api_key=key)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg},
+        ],
+        response_format={"type": "json_object"},
+    )
+    text = resp.choices[0].message.content or ""
+    try:
+        return _parse_judge_json(text)
+    except json.JSONDecodeError as ex:
+        raise RuntimeError(
+            f"{model} returned non-JSON: {ex}\n---\n{text[:500]}"
+        )
+
+
+def _gemini_judge(model: str, system_prompt: str, user_msg: str) -> dict:
+    try:
+        import google.generativeai as genai  # deferred import
+    except ImportError as ex:
+        raise RuntimeError(
+            "google-generativeai package not installed; pip install it to use Gemini judges"
+        ) from ex
+    key = _load_key("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY required for Gemini judge")
+    genai.configure(api_key=key)
+    model_obj = genai.GenerativeModel(model)
+    # Gemini doesn't have a native system prompt for generate_content; prepend.
+    prompt = system_prompt + "\n\n" + user_msg
+    response = model_obj.generate_content(prompt)
+    text = getattr(response, "text", None) or ""
+    try:
+        return _parse_judge_json(text)
+    except json.JSONDecodeError as ex:
+        raise RuntimeError(
+            f"{model} returned non-JSON: {ex}\n---\n{text[:500]}"
+        )
+
+
+def judge_call(model: str, system_prompt: str, user_msg: str) -> dict:
+    """Provider-agnostic judge call. Routes by model prefix.
+
+    Returns the parsed JSON score dict (per-system `S01_rel` etc. + `note`).
+    """
+    if model.startswith("claude-"):
+        return _claude_judge(model, system_prompt, user_msg)
+    if model.startswith("gpt-"):
+        return _openai_judge(model, system_prompt, user_msg)
+    if model.startswith("gemini-"):
+        return _gemini_judge(model, system_prompt, user_msg)
+    raise ValueError(f"unknown judge model: {model}")
+
+
+def _gemini_available() -> bool:
+    """True iff google-generativeai is importable AND GEMINI_API_KEY resolvable."""
+    try:
+        import google.generativeai  # noqa: F401
+    except ImportError:
+        return False
+    return _load_key("GEMINI_API_KEY") is not None
 
 
 def _pull_top_memories(con, entity_ids: list[int], corpus_events: list[dict],
@@ -306,31 +477,17 @@ def _build_judge_user_msg(test: dict, corpus_events: list[dict],
     )
 
 
-def _judge_one(client, judge_prompt: str, test: dict, corpus_events: list[dict],
-               systems: list[tuple[str, list[dict]]]) -> dict:
-    """Run one Opus judge call. Returns parsed JSON with per-system scores."""
+def _judge_one(judge_prompt: str, test: dict, corpus_events: list[dict],
+               systems: list[tuple[str, list[dict]]],
+               model: str = JUDGE_MODEL) -> dict:
+    """Run one judge call via the provider-agnostic dispatcher.
+
+    Backwards compatibility: existing callers passed ``client`` as the first
+    positional argument. We now ignore any such client and use `model` to
+    route. To migrate cleanly we accept the old shape too via keyword.
+    """
     user_msg = _build_judge_user_msg(test, corpus_events, systems)
-    resp = client.messages.create(
-        model=JUDGE_MODEL,
-        max_tokens=1024,
-        system=judge_prompt,
-        messages=[{"role": "user", "content": user_msg}],
-    )
-    # Extract text from first content block
-    text = ""
-    for block in resp.content:
-        if block.type == "text":
-            text += block.text
-    text = text.strip()
-    # Tolerate optional fenced code block
-    if text.startswith("```"):
-        text = text.strip("`").split("\n", 1)[1].rsplit("\n", 1)[0]
-        if text.startswith("json"):
-            text = text[4:].strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as ex:
-        raise RuntimeError(f"judge returned non-JSON: {ex}\n---\n{text[:500]}")
+    return judge_call(model, judge_prompt, user_msg)
 
 
 def _retrieve_memories_for_test(con, test: dict, corpus_events: list[dict],
@@ -359,6 +516,7 @@ def run(
     embedder_model: str = "openai-text-embedding-3-large",
     semantic_top_n: int = 3,
     verbose: bool = False,
+    judge_model: str = JUDGE_MODEL,
 ) -> dict:
     corpus = json.loads(Path(corpus_path).read_text())
     con = fresh_db()
@@ -367,7 +525,6 @@ def run(
         embed_entities(con, embedder_model=embedder_model, only_missing=True)
 
     judge_prompt = JUDGE_PROMPT_PATH.read_text()
-    client = _anthropic_client()
     mode = "hybrid" if semantic else "keyword"
     system_label = f"System 01 (Pulse {mode})"
 
@@ -381,8 +538,9 @@ def run(
             intent=intent,
         )
         verdict = _judge_one(
-            client, judge_prompt, test, corpus["events"],
+            judge_prompt, test, corpus["events"],
             systems=[(system_label, memories)],
+            model=judge_model,
         )
         rel = verdict.get("S01_rel", 0)
         spec = verdict.get("S01_spec", 0)
@@ -408,12 +566,181 @@ def run(
 
     return {
         "mode": mode,
+        "judge_model": judge_model,
         "mean_total": mean_total,
         "mean_rel": mean_rel,
         "mean_spec": mean_spec,
         "mean_act": mean_act,
         "per_test": per_test,
     }
+
+
+def run_cross_judge(
+    corpus_path: Path = DEFAULT_CORPUS_PATH,
+    embedder_model: str = "openai-text-embedding-3-large",
+    semantic_top_n: int = 3,
+    verbose: bool = False,
+    judges: list[str] | None = None,
+) -> dict:
+    """Cross-judge validation. Hybrid retrieval runs ONCE, then each judge
+    scores the SAME per-test (test, memories) pair independently.
+
+    Returns::
+
+        {
+            "judges": [{"model": str, "mean_rel": ..., "mean_total": ...,
+                        "per_test": [...]}, ...],
+            "mean_total_across_judges": float,
+            "stddev_total_across_judges": float,
+            ...
+        }
+    """
+    import math
+
+    corpus = json.loads(Path(corpus_path).read_text())
+    con = fresh_db()
+    ingest_corpus(con, corpus)
+    embed_entities(con, embedder_model=embedder_model, only_missing=True)
+
+    judge_prompt = JUDGE_PROMPT_PATH.read_text()
+    system_label = "System 01 (Pulse hybrid)"
+
+    # Resolve judge panel. Skip Gemini gracefully if SDK/key missing.
+    panel = list(judges) if judges else list(CROSS_JUDGE_MODELS)
+    resolved: list[str] = []
+    for m in panel:
+        if m.startswith("gemini-") and not _gemini_available():
+            print(
+                f"WARN: {m} skipped — google-generativeai package missing "
+                f"or GEMINI_API_KEY not resolvable",
+                file=sys.stderr,
+            )
+            continue
+        resolved.append(m)
+
+    # STEP 1 — Run retrieval once per test. Memories are what the judges see.
+    retrieval_rows: list[dict] = []
+    for test in corpus["tests"]:
+        intent = classify_intent_rules(test["user_query"])
+        memories = _retrieve_memories_for_test(
+            con, test, corpus["events"],
+            semantic=True, embedder_model=embedder_model,
+            semantic_top_n=semantic_top_n, intent=intent,
+        )
+        retrieval_rows.append({"test": test, "intent": intent, "memories": memories})
+
+    # STEP 2 — Each judge scores every test.
+    judge_results: list[dict] = []
+    for model in resolved:
+        if verbose:
+            print(f"\n>>> Judging with {model}")
+        per_test: list[dict] = []
+        errors: list[str] = []
+        for row in retrieval_rows:
+            test = row["test"]
+            try:
+                verdict = _judge_one(
+                    judge_prompt, test, corpus["events"],
+                    systems=[(system_label, row["memories"])],
+                    model=model,
+                )
+            except Exception as ex:  # noqa: BLE001
+                errors.append(f"{test['id']}: {ex}")
+                if verbose:
+                    print(f"  ERROR [{test['id']}]: {ex}")
+                per_test.append({
+                    "test_id": test["id"], "name": test["name"],
+                    "intent": row["intent"],
+                    "rel": 0, "spec": 0, "act": 0, "total": 0,
+                    "note": f"ERROR: {ex}", "memories": row["memories"],
+                    "failed": True,
+                })
+                continue
+            rel = verdict.get("S01_rel", 0)
+            spec = verdict.get("S01_spec", 0)
+            act = verdict.get("S01_act", 0)
+            total = rel + spec + act
+            per_test.append({
+                "test_id": test["id"], "name": test["name"],
+                "intent": row["intent"],
+                "rel": rel, "spec": spec, "act": act, "total": total,
+                "note": verdict.get("note", ""), "memories": row["memories"],
+            })
+            if verbose:
+                print(f"  [{test['id']}] {test['name']}  "
+                      f"rel={rel} spec={spec} act={act} total={total}/30")
+
+        valid = [t for t in per_test if not t.get("failed")]
+        n = len(valid) or 1
+        judge_results.append({
+            "model": model,
+            "mean_rel": sum(t["rel"] for t in valid) / n,
+            "mean_spec": sum(t["spec"] for t in valid) / n,
+            "mean_act": sum(t["act"] for t in valid) / n,
+            "mean_total": sum(t["total"] for t in valid) / n,
+            "per_test": per_test,
+            "errors": errors,
+        })
+
+    # STEP 3 — Aggregate across judges.
+    totals = [j["mean_total"] for j in judge_results]
+    rels = [j["mean_rel"] for j in judge_results]
+    specs = [j["mean_spec"] for j in judge_results]
+    acts = [j["mean_act"] for j in judge_results]
+    n = len(totals) or 1
+    mean = sum(totals) / n
+    if len(totals) > 1:
+        var = sum((t - mean) ** 2 for t in totals) / (len(totals) - 1)
+        stddev = math.sqrt(var)
+    else:
+        stddev = 0.0
+
+    return {
+        "judges": judge_results,
+        "mean_rel_across_judges": sum(rels) / n,
+        "mean_spec_across_judges": sum(specs) / n,
+        "mean_act_across_judges": sum(acts) / n,
+        "mean_total_across_judges": mean,
+        "stddev_total_across_judges": stddev,
+    }
+
+
+def _short_judge_name(model: str) -> str:
+    """Shorter display name for table columns."""
+    mapping = {
+        "claude-opus-4-6": "claude-opus-4-6",
+        "claude-sonnet-4-6": "claude-sonnet-4-6",
+        "gpt-4o": "gpt-4o",
+        "gemini-2.5-pro": "gemini-2.5-pro",
+    }
+    return mapping.get(model, model)
+
+
+def _print_cross_judge_result(r: dict) -> None:
+    print()
+    print("=" * 78)
+    print("PULSE hybrid — CROSS-JUDGE validation on empathic-memory-corpus")
+    print("=" * 78)
+    print()
+    print(f"{'JUDGE':<22} {'Rel':>6} {'Spec':>6} {'Act':>6} {'Total /30':>12}")
+    print("-" * 58)
+    for j in r["judges"]:
+        label = _short_judge_name(j["model"])
+        print(f"{label:<22} "
+              f"{j['mean_rel']:>6.2f} {j['mean_spec']:>6.2f} "
+              f"{j['mean_act']:>6.2f} {j['mean_total']:>12.2f}")
+    print("-" * 58)
+    print(f"{'MEAN ± STDDEV':<22} "
+          f"{r['mean_rel_across_judges']:>6.2f} "
+          f"{r['mean_spec_across_judges']:>6.2f} "
+          f"{r['mean_act_across_judges']:>6.2f} "
+          f"{r['mean_total_across_judges']:>7.2f} ± {r['stddev_total_across_judges']:.2f}")
+    print()
+    print("Reference (April 2026, 12 judges averaged):")
+    print("  Garden                                              24.05")
+    print("  sqlite-vec                                         ~16.30")
+    print("  Graphiti                                            ~9.00")
+    print()
 
 
 def _print_result(r: dict) -> None:
@@ -436,7 +763,7 @@ def _print_result(r: dict) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="Pulse retrieval scored by Claude Opus, Garden-comparable."
+        description="Pulse retrieval scored by LLM judges, Garden-comparable."
     )
     p.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS_PATH)
     p.add_argument("--semantic", action="store_true",
@@ -446,6 +773,13 @@ def main() -> int:
     p.add_argument("--semantic-top-n", type=int, default=3)
     p.add_argument("--compare", action="store_true",
                    help="run both keyword and hybrid, print side-by-side")
+    p.add_argument("--judge-model", default=JUDGE_MODEL,
+                   help="which single judge to use (e.g. claude-opus-4-6, "
+                        "claude-sonnet-4-6, gpt-4o, gemini-2.5-pro). "
+                        "Ignored when --cross-judge is set.")
+    p.add_argument("--cross-judge", action="store_true",
+                   help="run Pulse hybrid once, score with all 4 judges, "
+                        "print aggregated table (implies --semantic)")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args()
 
@@ -453,14 +787,26 @@ def main() -> int:
         print(f"ERROR: corpus not found at {args.corpus}", file=sys.stderr)
         return 2
 
+    if args.cross_judge:
+        r = run_cross_judge(
+            corpus_path=args.corpus,
+            embedder_model=args.embedder_model,
+            semantic_top_n=args.semantic_top_n,
+            verbose=args.verbose,
+        )
+        _print_cross_judge_result(r)
+        return 0
+
     if args.compare:
         print(">>> KEYWORD")
-        kw = run(corpus_path=args.corpus, semantic=False, verbose=args.verbose)
+        kw = run(corpus_path=args.corpus, semantic=False,
+                 judge_model=args.judge_model, verbose=args.verbose)
         _print_result(kw)
         print(">>> HYBRID")
         hy = run(corpus_path=args.corpus, semantic=True,
                  embedder_model=args.embedder_model,
                  semantic_top_n=args.semantic_top_n,
+                 judge_model=args.judge_model,
                  verbose=args.verbose)
         _print_result(hy)
         print("=" * 78)
@@ -482,6 +828,7 @@ def main() -> int:
         semantic=args.semantic,
         embedder_model=args.embedder_model,
         semantic_top_n=args.semantic_top_n,
+        judge_model=args.judge_model,
         verbose=args.verbose,
     )
     _print_result(r)

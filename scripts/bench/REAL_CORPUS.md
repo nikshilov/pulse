@@ -215,6 +215,84 @@ engagement (#2, flagged positive) to slot 3 instead. A "family-scoped"
 flag heuristic could fix it but would require corpus-level tuning. Left
 as a known limit.
 
+## Cross-judge validation (Task E, 2026-04-16)
+
+The Opus-only win (23.80/30 at Task D) is a single-judge result. April 2026
+Garden bench averaged 12 judges to land at 24.05 — any system claiming
+"beats Garden" needs to replicate across multiple judges before it counts.
+
+Added `--cross-judge` mode to `run_llm_judge.py`: runs Pulse hybrid retrieval
+ONCE, then scores the same (test, memories) pair with each of 4 judges
+(Opus, Sonnet, GPT-4o, Gemini 2.5 Pro) via provider-agnostic `judge_call()`.
+Keys load from env vars first, then from `~/.openclaw/secrets/*` files.
+
+### Result (4-judge panel, 2026-04-16 evening)
+
+| Judge              |  Rel  | Spec  |  Act  | **Total /30** |
+|--------------------|-------|-------|-------|---------------|
+| claude-opus-4-6    | 7.40  | 8.80  | 7.60  | **23.80**     |
+| claude-sonnet-4-6  | 7.40  | 9.00  | 7.60  | **24.00**     |
+| gpt-4o             | 7.80  | 8.60  | 7.40  | **23.80**     |
+| gemini-2.5-pro     | 8.00  | 10.00 | 8.40  | **26.40**     |
+| **MEAN ± STDDEV**  | 7.65  | 9.10  | 7.75  | **24.50 ± 1.27** |
+
+Reference: Garden cross-judge mean (April 2026, 12 judges) = **24.05**.
+
+### Commentary
+
+- **Opus 23.80** reproduces the Task D number (23.60 ± 0.30 baseline) —
+  within noise. The Opus result IS the typical Pulse result, not a
+  one-shot fluke.
+- **Sonnet 24.00** is +0.20 above Opus. Consistent with Opus's scoring
+  philosophy — same family tends to agree within ~0.5 on this rubric.
+- **GPT-4o 23.80** ties Opus. Independent of Anthropic family. GPT-4o
+  gave T4 "recency_aware_state" a 25 vs Opus's 23, but docked T1 the
+  same amount; net near-parity.
+- **Gemini 2.5 Pro 26.40** is 2.60 above mean — the outlier. Gave
+  perfect 10s on every `spec` (vs other judges' 8–9). Not obviously
+  wrong — Pulse returns concrete event_ids, dates, exact texts —
+  but suggests Gemini is more generous on this dimension.
+
+**Stddev = 1.27.** A single-judge 23.80 is within ~0.6σ of the 4-judge
+mean — the Opus number is a representative, not optimistic, sample.
+
+### Comparison to Garden
+
+Pulse cross-judge mean **24.50 ± 1.27** vs Garden **24.05**. Delta = +0.45,
+~0.35σ. That is **within noise**. The Opus-only margin (+1.80 over Garden's
+22.00 on Opus) shrinks on the broader panel because Garden's cross-judge
+mean benefited from non-Opus judges too (Garden's 24.05 averaged 12 judges
+that include generous-like-Gemini ones).
+
+Honest reading: **Pulse matches Garden** on the 4-judge panel. The Task D
+improvement is real and holds across judges — but calling it a clean win
+over Garden requires either (a) running the same 12-judge panel Garden
+used, or (b) accepting the narrower 4-judge panel and the +0.45 delta that
+is, at best, "not worse."
+
+What this validates:
+- Intent-aware ranking (Task D) is not an Opus-specific artifact. All
+  four judges scored Pulse near or above 24 — the 17.6 pre-Task-D baseline
+  would have been obvious to any of them.
+- No judge refused to score. No malformed JSON. No provider bug.
+
+What this does not validate:
+- "Pulse beats Garden." On shared judges (Opus for both) Pulse wins +1.80.
+  On broader panels the gap collapses.
+
+### Cost
+
+4 judges × 5 tests = 20 calls on one run.
+- Opus: 5 × ($15 in / $75 out / 1M, ~3k+300 tokens) ≈ $0.34
+- Sonnet: 5 × ($3 in / $15 out) ≈ $0.07
+- GPT-4o: 5 × ($2.50 in / $10 out) ≈ $0.05
+- Gemini 2.5 Pro: 5 × ($1.25 in / $5 out on short) ≈ $0.03
+
+**Actual cost: ~$0.50** per cross-judge run (lower than task estimate —
+Gemini returned perfect-JSON, no retries).
+
+---
+
 Compared with the synthetic fixture bench (`scripts/bench/run_eval.py` on
 the Elle/Nik fixture):
 
