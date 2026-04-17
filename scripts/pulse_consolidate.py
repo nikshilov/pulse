@@ -300,6 +300,111 @@ def extraction_efficiency(con: sqlite3.Connection) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Embedding generation (Phase-3 POC — semantic retrieval side channel)
+# ---------------------------------------------------------------------------
+
+def embed_entities(
+    con: sqlite3.Connection,
+    embedder_model: str = "fake-local",
+    only_missing: bool = True,
+    batch_size: int = 50,
+) -> int:
+    """Generate / refresh entity embeddings and UPSERT into `entity_embeddings`.
+
+    Selection rule:
+      - if `only_missing=True` (default): pick entities that either have no
+        embedding row OR whose `last_seen` is newer than
+        `entity_embeddings.updated_at` (need re-embed because the entity was
+        touched after it was last embedded).
+      - if `only_missing=False`: pick ALL entities — forces a full re-embed,
+        useful when switching models.
+
+    Entities with `do_not_probe=1` are NOT excluded here — they still get
+    embedded so that downstream consolidation logic can use them if it ever
+    lifts the gate. The retrieval path is what enforces the opt-out (seed-
+    level and BFS-level gates inside `retrieval.py`).
+
+    text_source format (one-line concatenation of the entity's retrieval-
+    relevant text):
+        "{canonical_name} | kind={kind} | aliases={csv} | {top 3 fact texts}"
+
+    Batching: `batch_size` texts per `embed_texts` call. For `fake-local` the
+    batch size is largely irrelevant (it's just SHA-256), but for OpenAI it
+    bounds the per-request payload. 50 is a safe default at the OpenAI
+    text-embedding-3-large input-tokens-per-request limit.
+
+    Returns the count of rows upserted.
+    """
+    # Import path depends on how the caller entered the module:
+    #   - pytest / CLI with `scripts/` on sys.path → `extract.embedder`
+    #   - external caller with the repo root on sys.path → `scripts.extract.embedder`
+    try:
+        from extract.embedder import embed_texts, embedding_dim
+    except ImportError:
+        from scripts.extract.embedder import embed_texts, embedding_dim  # type: ignore
+
+    if only_missing:
+        rows = con.execute(
+            "SELECT e.id, e.canonical_name, e.kind, e.aliases, e.last_seen "
+            "FROM entities e "
+            "LEFT JOIN entity_embeddings ee ON ee.entity_id = e.id "
+            "WHERE ee.entity_id IS NULL OR e.last_seen > ee.updated_at"
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT id, canonical_name, kind, aliases, last_seen FROM entities"
+        ).fetchall()
+
+    if not rows:
+        return 0
+
+    # Build (entity_id, text_source) pairs. Pulling the top 3 facts per entity
+    # is a separate cheap query per row; at POC scale this is fine.
+    records: list[tuple[int, str]] = []
+    for eid, name, kind, aliases_json, _last_seen in rows:
+        try:
+            aliases = json.loads(aliases_json) if aliases_json else []
+        except (json.JSONDecodeError, TypeError):
+            aliases = []
+        fact_rows = con.execute(
+            "SELECT text FROM facts WHERE entity_id = ? "
+            "ORDER BY confidence DESC, id ASC LIMIT 3",
+            (eid,),
+        ).fetchall()
+        fact_texts = [r[0] for r in fact_rows if r[0]]
+        text_source = (
+            f"{name} | kind={kind or 'unknown'} | "
+            f"aliases={', '.join(aliases)} | {' '.join(fact_texts)}"
+        ).strip()
+        records.append((eid, text_source))
+
+    dim = embedding_dim(embedder_model)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    upserted = 0
+
+    for i in range(0, len(records), batch_size):
+        chunk = records[i : i + batch_size]
+        texts = [t for (_, t) in chunk]
+        vectors = embed_texts(texts, model=embedder_model)
+        for (eid, text_source), vec in zip(chunk, vectors):
+            con.execute(
+                "INSERT INTO entity_embeddings "
+                "(entity_id, model, dim, vector_json, text_source, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(entity_id) DO UPDATE SET "
+                "    model=excluded.model, "
+                "    dim=excluded.dim, "
+                "    vector_json=excluded.vector_json, "
+                "    text_source=excluded.text_source, "
+                "    updated_at=excluded.updated_at",
+                (eid, embedder_model, dim, json.dumps(vec), text_source, now),
+            )
+            upserted += 1
+
+    return upserted
+
+
+# ---------------------------------------------------------------------------
 # Main consolidation runner
 # ---------------------------------------------------------------------------
 
@@ -307,6 +412,7 @@ def run_consolidation(
     db_path: str,
     hrv_points: "Sequence[HrvPoint] | None" = None,
     self_entity_id: int | None = None,
+    embed_model: str | None = None,
 ) -> dict:
     """Run the full consolidation pipeline.
 
@@ -334,6 +440,12 @@ def run_consolidation(
                       enqueued with NULL subject — the question is still
                       addressable by its text and the VDS worker can route
                       it directly to Nik.
+      embed_model: if set (e.g. "fake-local" or
+                   "openai-text-embedding-3-large"), run `embed_entities`
+                   after decay/dedup/co-occurrence so any newly-discovered
+                   entities from this consolidation tick get embedded.
+                   Default None = skip embedding entirely (zero behaviour
+                   change versus pre-Phase-3 consolidation).
     """
     con = _open_connection(db_path)
 
@@ -404,6 +516,17 @@ def run_consolidation(
                         valence_result = {"enqueued": False, "reason": "dedup_hit",
                                           "question_id": None}
 
+            # Embedding generation (Phase-3 POC). Opt-in only — default
+            # embed_model=None skips entirely. Runs LATE so any entities
+            # touched/created above (merges redirecting facts, new rows
+            # from upstream extract jobs since last consolidate) get
+            # refreshed vectors in the same transaction.
+            embeddings_upserted = 0
+            if embed_model is not None:
+                embeddings_upserted = embed_entities(
+                    con, embedder_model=embed_model, only_missing=True
+                )
+
             _set_metadata(con, "last_consolidation_ts", datetime.now(timezone.utc).isoformat())
             con.execute("COMMIT")
         except Exception:
@@ -425,6 +548,8 @@ def run_consolidation(
         "extraction_efficiency": efficiency,
         "hrv_care": hrv_result,
         "valence_care": valence_result,
+        "embeddings_upserted": embeddings_upserted,
+        "embed_model": embed_model,
     }
 
 

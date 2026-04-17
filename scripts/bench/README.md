@@ -23,9 +23,89 @@ This harness is the smallest possible answer to that question.
 ```bash
 python scripts/bench/run_eval.py            # summary + by-category table
 python scripts/bench/run_eval.py --verbose  # + per-query breakdown
+python scripts/bench/run_eval.py --semantic # + hybrid (keyword+semantic) comparison
 ```
 
 Exits 0 on success. Uses only stdlib — no extra deps.
+
+## Semantic retrieval (POC, --semantic flag)
+
+Judge 4 (rival engineer, 2026-04-15) and Judge 1 (A/B designer) flagged
+keyword-only retrieval as the single biggest weakness. Queries like
+`"пусто сегодня, ничего не хочется"` (q08) and `"Как там сын Ани?"` (q05)
+return empty under keyword matching — no entity has those tokens in any
+alias list, and the 2-hop anchor `Ани` is a Russian declension `Аня` can't
+reach without morphological expansion.
+
+The semantic path closes that gap by running a cosine-top-N pass over dense
+entity embeddings and UNION-ing the result with keyword seeds BEFORE BFS and
+ranking. The pipeline:
+
+```
+tokenize  → keyword seeds ─┐
+                           ├─ UNION ─→ BFS expansion ─→ rank ─→ top-k
+embed(msg)→ cosine top-N ──┘
+          (entity_embeddings)
+```
+
+### Enabling the side channel
+
+`retrieve_context(..., semantic=True)` at call time. Default is `semantic=False`
+— all 147 pre-Phase-3 tests continue to pass byte-identical. When enabled, the
+output dict grows two keys: `retrieval_method: "hybrid"` and
+`semantic_seeds: list[int]`.
+
+Embeddings must be populated first, either at:
+  - consolidation time: `run_consolidation(db, embed_model="fake-local")`
+    or `embed_model="openai-text-embedding-3-large"` (opt-in; default `None`
+    skips embedding entirely).
+  - ad-hoc: `embed_entities(con, embedder_model=...)` directly.
+
+### ⚠️ `fake-local` is plumbing, not semantics
+
+The default embedder model is `fake-local`: a deterministic SHA-256-derived
+128-dim vector. It validates that the full pipeline (store → load → cosine →
+seed union → BFS → rank) is wired end-to-end WITHOUT any API calls, network,
+or paid dependencies. It is NOT semantically meaningful.
+
+Concretely: on the fixture bench, `fake-local` hybrid does inject the
+ground-truth entities 8 (Fedya) and 14 (loneliness) into the top-10 of the
+known-failure queries q05/q08 — R@10 goes 0.00 → 1.00 on both. But aggregate
+MRR/Critical-hit DEGRADES because the random cosine ordering pulls unrelated
+entities into top-5 of easy queries. Expect the same shape on any run:
+
+```
+HYBRID COMPARISON  (n=15 queries)
+  metric            keyword      hybrid       delta
+  Recall@5            0.733       0.467      -0.267   ← noise, fake-local is random
+  Recall@10           0.867       0.800      -0.067   ← noise, see above
+  MRR                 0.439       0.234      -0.205
+  Critical-hit        0.267       0.067      -0.200
+
+KNOWN-FAILURE QUERIES  (keyword → hybrid)
+  q05 "Как там сын Ани?"        R@10 0.00 → 1.00   ← plumbing works
+  q08 "пусто сегодня, ничего…"  R@10 0.00 → 1.00   ← plumbing works
+```
+
+The green on q05/q08 is not a semantic win — it's that cosine returns a random
+permutation that happens to include every entity, and `semantic_top_n=20` ≥
+fixture size 18. With a larger graph the random ordering will stop saturating
+top-N and the "wins" on q05/q08 will vanish too.
+
+**Real semantic wins require a real embedder.** Next step: rerun with
+`--embedder-model openai-text-embedding-3-large` (3072-dim, requires
+`OPENAI_API_KEY` and the optional `openai` Python package). That's Nik's
+follow-up decision — the pipe now exists end-to-end.
+
+### Regression contract
+
+- `python -m pytest scripts/tests/ -q` → 159+ passed (147 pre-existing + new
+  embedding tests). Default `semantic=False` must keep
+  `retrieval_method="keyword"` and NOT include `semantic_seeds` in the output.
+- `python scripts/bench/run_eval.py` (no flags) must match the 2026-04-16
+  baseline numbers exactly:
+  `Recall@5 0.733 ± 0.442, Recall@10 0.867 ± 0.340, MRR 0.439 ± 0.363,
+   Critical-hit 0.267 ± 0.442`.
 
 ## Metrics
 
