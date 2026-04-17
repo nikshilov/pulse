@@ -336,6 +336,61 @@ def test_self_entity_still_appears_when_directly_matched(tmp_path):
     assert "Nik" in names
 
 
+def test_rank_self_loses_top1_to_lower_salience_other_when_both_match(tmp_path):
+    """Real-corpus bench 2026-04-17 pattern: self mentioned in every observation
+    → highest salience. Other entities with lower salience + emo>0.6 must still
+    rank higher than self when both match the query, because the 0.5 self-penalty
+    kicks in. Without the penalty (stripping anchor alone), self won top-1 on all
+    5 real-corpus queries (Crit-hit@1 = 0.00).
+
+    Reproduces Alex/Maya from empathic-memory-corpus: Alex salience=1.0 emo=0.9
+    is_self=1; Maya salience=0.17 emo=0.8 is_self=0 (fiancée, anchor-eligible).
+    """
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    # Self (omnipresent in corpus → max salience): score = (1.0+0.9)*recency*1.0*0.5 = 0.95
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight, is_self) "
+        "VALUES (1, 'Alex', 'person', ?, ?, ?, 1.0, 0.9, 1)",
+        (json.dumps(["target"]), now, now),
+    )
+    # Other (mentioned ~5 times, emotionally central): score = (0.17+0.8)*recency*1.5*1.0 = 1.455
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight, is_self) "
+        "VALUES (2, 'Maya', 'person', ?, ?, ?, 0.17, 0.8, 0)",
+        (json.dumps(["target"]), now, now),
+    )
+    result = retrieve_context(con, "target")
+    assert result["matched_entities"][0]["canonical_name"] == "Maya"
+    # Both appear — self is not excluded, just demoted
+    names = [e["canonical_name"] for e in result["matched_entities"]]
+    assert "Alex" in names
+
+
+def test_rank_self_stays_top1_when_no_other_match(tmp_path):
+    """Pure self-query ("как я?"): self should still appear as top-1 when no
+    other entity matches. The 0.5 penalty lowers the absolute score but doesn't
+    exclude — and with no competitor, self wins by default.
+    """
+    from extract.retrieval import retrieve_context
+    con = _fresh_db(tmp_path)
+    now = "2026-04-16T00:00:00Z"
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight, is_self) "
+        "VALUES (1, 'Alex', 'person', ?, ?, ?, 1.0, 0.9, 1)",
+        (json.dumps(["target"]), now, now),
+    )
+    # Non-matching other entity: won't be in seed at all
+    con.execute(
+        "INSERT INTO entities (id, canonical_name, kind, aliases, first_seen, last_seen, salience_score, emotional_weight, is_self) "
+        "VALUES (2, 'Unrelated', 'person', ?, ?, ?, 0.9, 0.9, 0)",
+        (json.dumps([]), now, now),
+    )
+    result = retrieve_context(con, "target")
+    assert result["matched_entities"][0]["canonical_name"] == "Alex"
+
+
 def test_rank_kind_aware_decay_concept_fades_faster(tmp_path):
     """Concept (λ=0.01) 100 days stale loses to person (λ=0.001) 100 days stale."""
     from extract.retrieval import retrieve_context

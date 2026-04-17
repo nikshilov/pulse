@@ -359,14 +359,20 @@ def _rank(entities: list[dict]) -> list[dict]:
 
     - recency       exp(-λ × days), λ = DECAY_RATES[kind] — retrieval-time decay
                     (non-destructive, unlike mutation-based decay in consolidation)
-    - anchor        1.5 if person with emotional_weight > 0.6 (core people boost),
-                    but ALWAYS 1.0 for the self-entity (`is_self=1`). Judge 7
-                    observation: Nik's self-entity is frozen at seed values
-                    (salience=1.0, emo=0.9) and never decays. Without this strip
-                    the self wins every anchor contest — in the bench 11/15
-                    queries had Nik as top-1 regardless of subject. The self can
-                    still appear in results (direct aliases still match), it
-                    just no longer gets the ×1.5 anchor thumb on the scale.
+    - anchor        1.5 if person with emotional_weight > 0.6 (core people boost).
+                    For the self-entity (`is_self=1`): anchor=1.0 (no boost) AND
+                    a multiplicative self_penalty=0.5 is applied. Judge 7 /
+                    real-corpus bench 2026-04-17 observation: stripping anchor
+                    alone was insufficient — because the self-entity gets
+                    mentioned in virtually every observation, it accumulates
+                    the highest salience in the graph (Alex ≈ 1.0 in the
+                    empathic corpus; Maya/Sarah ≈ 0.2-0.3). With anchor=1.0
+                    and no penalty, self still won top-1 on all 5 bench
+                    queries (Crit-hit@1 = 0.00). The 0.5 penalty lets other
+                    emotionally-central people (via anchor=1.5) outrank self
+                    when they are relevant, without excluding self entirely —
+                    pure self-queries ("как я?") still return self at top
+                    because no other entity matches at all.
     - emotional_weight is ADDITIVE so an emo-heavy low-salience memory is not
       crushed by a salience-heavy but emotionally flat one. Emotional_weight
       is used for RANKING only, never for gating — emotionally heavy entities
@@ -392,15 +398,18 @@ def _rank(entities: list[dict]) -> list[dict]:
         emo = float(ent.get("emotional_weight") or 0.0)
         is_self = int(ent.get("is_self") or 0)
         if is_self:
-            # Self-entity: strip anchor boost. See Judge 7 in docstring above.
+            # Self-entity: strip anchor boost AND apply 0.5 suppression.
+            # See Judge 7 + real-corpus bench notes in docstring above.
             anchor = 1.0
+            self_penalty = 0.5
         else:
             anchor = 1.5 if kind == "person" and emo > 0.6 else 1.0
+            self_penalty = 1.0
 
         hop = ent.get("_hop", 0)
         hop_penalty = 0.7 ** hop
 
-        score = (salience + emo) * recency * anchor * hop_penalty
+        score = (salience + emo) * recency * anchor * hop_penalty * self_penalty
         scored.append((score, ent))
 
     scored.sort(key=lambda x: x[0], reverse=True)
