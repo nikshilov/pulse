@@ -82,6 +82,24 @@ from extract.embedder import embed_texts
 # `scripts/bench/baselines/EMPATHIC_SUBSET_RESULTS.md`.
 DEFAULT_LAMBDA = 0.001
 
+# Per-belief-class decay rates (migration 014, DEUS-inspired vocabulary).
+# Applied at retrieval time: effective_lambda = BELIEF_DECAY[belief_class].
+# Events without belief_class (pre-014 rows) fall back to DEFAULT_LAMBDA.
+#
+# Rationale per class:
+#   axiom       — permanent truths, never decay (Nik's core-wound, Elle's identity)
+#   self_model  — slow (Elle's introspective facts — slow evolution)
+#   user_model  — default (Nik's psychological profile — long-lived but not eternal)
+#   operational — faster (day-to-day context, preferences)
+#   hypothesis  — fastest (provisional reads awaiting confirmation)
+BELIEF_DECAY: dict[str, float] = {
+    "axiom":       0.0,
+    "self_model":  0.0005,
+    "user_model":  0.001,
+    "operational": 0.003,
+    "hypothesis":  0.005,
+}
+
 # Embedder default. Fake-local exists for unit tests; production callers
 # should pass 'openai-text-embedding-3-large' explicitly so the choice is
 # visible in logs and the OpenAI API key presence is checked at call time.
@@ -103,6 +121,7 @@ def retrieve_events(
     lam: float = DEFAULT_LAMBDA,
     embedder_model: str = DEFAULT_EMBEDDER,
     top_n_candidates: int = DEFAULT_TOP_N_CANDIDATES,
+    use_belief_class: bool = True,
 ) -> list[dict]:
     """Return top-k events by (cosine × recency) rank.
 
@@ -171,11 +190,23 @@ def retrieve_events(
         days_ago = _days_since(event.get("ts"), now)
         if days_ago is None:
             days_ago = 30  # Unknown timestamps: treat as mildly recent.
-        recency = math.exp(-lam * days_ago)
-        score = cos * recency
+        # Pick decay rate: per-belief-class (post-014) or caller-supplied uniform.
+        if use_belief_class:
+            effective_lam = BELIEF_DECAY.get(event.get("belief_class", "operational"), lam)
+        else:
+            effective_lam = lam
+        recency = math.exp(-effective_lam * days_ago)
+        # confidence_floor: minimum score floor (axiom-preservation mechanic
+        # from DEUS). "Kristina wound" floor=0.85 survives 10-year-old recency.
+        # We apply floor to the recency × cosine product: the belief cannot
+        # lose salience below (floor × cosine). Pre-014 rows have floor=0 → no-op.
+        floor = event.get("confidence_floor", 0.0) or 0.0
+        base = cos * recency
+        score = max(base, cos * floor) if floor > 0 else base
         event["cosine"] = cos
         event["score"] = score
         event["days_ago"] = days_ago
+        event["effective_lambda"] = effective_lam
         ranked.append((score, event))
 
     ranked.sort(key=lambda t: t[0], reverse=True)
@@ -203,15 +234,48 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 def _fetch_event(con: sqlite3.Connection, event_id: int) -> dict | None:
-    """Load one event's retrieval-relevant fields. None if missing."""
-    row = con.execute(
-        "SELECT id, title, description, sentiment, emotional_weight, ts "
-        "FROM events WHERE id = ?",
-        (event_id,),
-    ).fetchone()
+    """Load one event's retrieval-relevant fields. None if missing.
+
+    Migration 014 added belief_class, confidence_floor, archivable, provenance.
+    This helper reads them via COALESCE so pre-014 databases (no columns)
+    still work — the PRAGMA table_info dance is avoided by catching the
+    OperationalError path via a defensive try/except over the richer query.
+    """
+    # Try the richer query first (post-migration-014).
+    try:
+        row = con.execute(
+            "SELECT id, title, description, sentiment, emotional_weight, ts, "
+            "       COALESCE(belief_class, 'operational') AS belief_class, "
+            "       COALESCE(confidence_floor, 0.0) AS confidence_floor, "
+            "       COALESCE(archivable, 1) AS archivable, "
+            "       COALESCE(provenance, 'interactive_memory') AS provenance "
+            "FROM events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # Pre-014 DB — columns don't exist. Fall back.
+        row = con.execute(
+            "SELECT id, title, description, sentiment, emotional_weight, ts "
+            "FROM events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        eid, title, description, sentiment, emotional_weight, ts = row
+        text = description or title or ""
+        return {
+            "id": eid, "text": text,
+            "sentiment": sentiment or 0.0,
+            "emotional_weight": emotional_weight or 0.0, "ts": ts,
+            "belief_class": "operational",
+            "confidence_floor": 0.0,
+            "archivable": 1,
+            "provenance": "interactive_memory",
+        }
     if row is None:
         return None
-    eid, title, description, sentiment, emotional_weight, ts = row
+    (eid, title, description, sentiment, emotional_weight, ts,
+     belief_class, confidence_floor, archivable, provenance) = row
     text = description or title or ""
     return {
         "id": eid,
@@ -219,6 +283,10 @@ def _fetch_event(con: sqlite3.Connection, event_id: int) -> dict | None:
         "sentiment": sentiment or 0.0,
         "emotional_weight": emotional_weight or 0.0,
         "ts": ts,
+        "belief_class": belief_class,
+        "confidence_floor": confidence_floor,
+        "archivable": int(archivable),
+        "provenance": provenance,
     }
 
 
