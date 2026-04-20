@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import math
-import sqlite3
+import sqlite3  # noqa: F401 — used by belief check tests
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -313,9 +313,153 @@ def test_lambda_zero_disables_recency(tmp_path):
 
     out = retrieve_events(
         con, shared, top_k=2, lam=0.0, embedder_model="fake-local",
+        use_belief_class=False,
     )
 
-    # With λ=0 both score the same raw cosine. No recency tiebreak; order
-    # depends on the internal sort which is stable — both must appear.
+    # With λ=0 AND use_belief_class=False both score the same raw cosine.
+    # Post-014 default uses per-belief-class decay; to test caller's explicit
+    # uniform λ, opt out of the class-based path.
     assert {e["id"] for e in out} == {1, 2}
     assert out[0]["score"] == pytest.approx(out[1]["score"], abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Belief vocabulary (migration 014)
+# ---------------------------------------------------------------------------
+
+def test_axiom_does_not_decay_over_time(tmp_path):
+    """An axiom-class event with 1000 days age should score the same cosine×1.
+
+    This is the Nik-core-wound preservation pattern: Kristina (10 years ago)
+    must never lose retrieval salience vs a fresh operational event when the
+    query matches her semantically.
+    """
+    from extract.retrieval_v2 import embed_events, retrieve_events
+    con = _fresh_db(tmp_path)
+    now = datetime(2026, 4, 18, tzinfo=timezone.utc)
+    text_a = "Kristina unique marker axiom event text"
+    # Axiom event, 1000 days old
+    con.execute(
+        "INSERT INTO events (id, title, description, sentiment, ts, belief_class) "
+        "VALUES (1, 'axiom', ?, 0.0, ?, 'axiom')",
+        (text_a, (now - timedelta(days=1000)).strftime("%Y-%m-%dT%H:%M:%SZ")),
+    )
+    con.commit()
+    embed_events(con, embedder_model="fake-local")
+
+    out = retrieve_events(con, text_a, embedder_model="fake-local")
+
+    assert len(out) == 1
+    # With belief_class=axiom → λ=0 → recency=1 → score=cos
+    assert out[0]["effective_lambda"] == 0.0
+    assert out[0]["score"] == pytest.approx(out[0]["cosine"], abs=1e-9)
+
+
+def test_hypothesis_decays_faster_than_user_model(tmp_path):
+    """Two events with same age but different belief_class should rank differently.
+
+    A hypothesis decays 5x faster than user_model. With same query match, fresh
+    user_model should outrank fresh hypothesis on equal age.
+    """
+    from extract.retrieval_v2 import embed_events, retrieve_events
+    con = _fresh_db(tmp_path)
+    now = datetime(2026, 4, 18, tzinfo=timezone.utc)
+    ts_old = (now - timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    text = "shared text across both belief classes for tie break"
+    con.execute(
+        "INSERT INTO events (id, title, description, sentiment, ts, belief_class) "
+        "VALUES (1, 'user_model', ?, 0.0, ?, 'user_model')",
+        (text, ts_old),
+    )
+    con.execute(
+        "INSERT INTO events (id, title, description, sentiment, ts, belief_class) "
+        "VALUES (2, 'hypothesis', ?, 0.0, ?, 'hypothesis')",
+        (text, ts_old),
+    )
+    con.commit()
+    embed_events(con, embedder_model="fake-local")
+
+    out = retrieve_events(con, text, top_k=2, embedder_model="fake-local")
+
+    ids = [e["id"] for e in out]
+    # user_model (λ=0.001) decays less than hypothesis (λ=0.005) → ranks first
+    assert ids == [1, 2]
+
+
+def test_confidence_floor_preserves_salience(tmp_path):
+    """An event with confidence_floor > 0 cannot score below cos × floor.
+
+    Tests the axiom-preservation mechanic: Kristina-wound with floor=0.85 stays
+    salient even after 10 years of decay.
+    """
+    from extract.retrieval_v2 import embed_events, retrieve_events
+    con = _fresh_db(tmp_path)
+    now = datetime(2026, 4, 18, tzinfo=timezone.utc)
+    text = "wound floor preservation test unique text"
+    # operational event with huge decay (3000 days) + floor=0.85
+    con.execute(
+        "INSERT INTO events (id, title, description, sentiment, ts, "
+        "                    belief_class, confidence_floor) "
+        "VALUES (1, 'wound', ?, 0.0, ?, 'operational', 0.85)",
+        (text, (now - timedelta(days=3000)).strftime("%Y-%m-%dT%H:%M:%SZ")),
+    )
+    con.commit()
+    embed_events(con, embedder_model="fake-local")
+
+    out = retrieve_events(con, text, embedder_model="fake-local")
+
+    # cos = 1.0 (identical text), floor=0.85, so score >= 0.85
+    # Without floor, score = cos × exp(-0.003 × 3000) ≈ cos × 0.00012 ≈ near zero.
+    # Floor lifts it back up to 0.85.
+    assert out[0]["score"] >= 0.85
+
+
+def test_retrieve_events_returns_belief_metadata(tmp_path):
+    """Returned events include belief_class/confidence_floor/archivable/provenance."""
+    from extract.retrieval_v2 import embed_events, retrieve_events
+    con = _fresh_db(tmp_path)
+    con.execute(
+        "INSERT INTO events (id, title, description, sentiment, ts, "
+        "belief_class, confidence_floor, archivable, provenance) "
+        "VALUES (1, 't', 'unique belief metadata test text', 0.0, "
+        "'2026-04-01T00:00:00Z', 'user_model', 0.5, 0, 'manual')"
+    )
+    con.commit()
+    embed_events(con, embedder_model="fake-local")
+
+    out = retrieve_events(con, "unique belief metadata test text",
+                          embedder_model="fake-local")
+
+    assert len(out) == 1
+    assert out[0]["belief_class"] == "user_model"
+    assert out[0]["confidence_floor"] == pytest.approx(0.5)
+    assert out[0]["archivable"] == 0
+    assert out[0]["provenance"] == "manual"
+
+
+def test_belief_class_check_constraint_rejects_bad_value(tmp_path):
+    """Migration 014 CHECK constraint blocks invalid belief_class values."""
+    con = _fresh_db(tmp_path)
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute(
+            "INSERT INTO events (id, title, description, sentiment, ts, belief_class) "
+            "VALUES (1, 't', 'x', 0, '2026-04-01T00:00:00Z', 'nonsense_class')"
+        )
+
+
+def test_default_belief_class_is_operational(tmp_path):
+    """Pre-014 test events that don't set belief_class should default to operational."""
+    from extract.retrieval_v2 import embed_events, retrieve_events
+    con = _fresh_db(tmp_path)
+    con.execute(
+        "INSERT INTO events (id, title, description, sentiment, ts) "
+        "VALUES (1, 't', 'default class test text', 0.0, '2026-04-01T00:00:00Z')"
+    )
+    con.commit()
+    embed_events(con, embedder_model="fake-local")
+
+    out = retrieve_events(con, "default class test text", embedder_model="fake-local")
+
+    assert out[0]["belief_class"] == "operational"
+    # effective lambda = 0.003 (operational)
+    assert out[0]["effective_lambda"] == pytest.approx(0.003)
