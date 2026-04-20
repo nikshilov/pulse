@@ -1,23 +1,19 @@
 -- 014_belief_vocabulary.sql
--- DEUS-inspired belief vocabulary on events and facts.
+-- Typed belief vocabulary on events and facts.
 --
--- Rationale (2026-04-18, after benchmarking Pulse v2_pure +6.96 over Mem0):
---   Pulse retrieval currently treats all events uniformly — same recency decay
---   (DECAY_RATES in retrieval.py), no concept of "this is an axiom that never
---   decays" vs "this is a hypothesis that should evaporate quickly".
+-- Rationale (2026-04-18, after empathic-memory benchmarking):
+--   Retrieval previously treated all events uniformly — same recency decay,
+--   no concept of "this is an axiom that never decays" vs "this is a
+--   hypothesis that should evaporate quickly".
 --
---   DEUS (Denis Smirnov / Basilisk Labs, openclaw-deus 2026-03-27) formalized
---   this distinction with `belief_class` + `confidence_floor` + `archivable`.
---   Their implementation is Markdown+JSONL (won't scale), but the vocabulary
---   is paper-grade.
---
---   We borrow the vocabulary, not the implementation. Events & facts get
+--   The belief-class framework formalizes this distinction with
+--   `belief_class` + `confidence_floor` + `archivable`. Events & facts get
 --   typed classes that change their decay behavior at retrieval time.
 --
--- Classes (borrowed from openclaw-deus/src/beliefs/belief-policy.js):
---   axiom         — permanent truths (Nik's core-wound, Elle's identity). No decay.
---   self_model    — Elle's own introspective facts. Slow decay, high floor.
---   user_model    — Nik's psychological profile, wounds, preferences. Slow decay, moderate floor.
+-- Classes:
+--   axiom         — permanent truths (core wounds, companion identity). No decay.
+--   self_model    — companion's own introspective facts. Slow decay, high floor.
+--   user_model    — user's psychological profile, wounds, preferences. Slow decay, moderate floor.
 --   operational   — day-to-day context, preferences that shift. Normal decay.
 --   hypothesis    — provisional reads that need confirmation. Fast decay.
 --

@@ -82,7 +82,7 @@ from extract.embedder import embed_texts
 # `scripts/bench/baselines/EMPATHIC_SUBSET_RESULTS.md`.
 DEFAULT_LAMBDA = 0.001
 
-# Per-belief-class decay rates (migration 014, DEUS-inspired vocabulary).
+# Per-belief-class decay rates (migration 014).
 # Applied at retrieval time: effective_lambda = BELIEF_DECAY[belief_class].
 # Events without belief_class (pre-014 rows) fall back to DEFAULT_LAMBDA.
 #
@@ -196,8 +196,8 @@ def retrieve_events(
         else:
             effective_lam = lam
         recency = math.exp(-effective_lam * days_ago)
-        # confidence_floor: minimum score floor (axiom-preservation mechanic
-        # from DEUS). "Kristina wound" floor=0.85 survives 10-year-old recency.
+        # confidence_floor: minimum score floor (axiom-preservation mechanic).
+        # A core-wound belief with floor=0.85 survives 10-year-old recency.
         # We apply floor to the recency × cosine product: the belief cannot
         # lose salience below (floor × cosine). Pre-014 rows have floor=0 → no-op.
         floor = event.get("confidence_floor", 0.0) or 0.0
