@@ -185,6 +185,35 @@ EMO_KEYWORDS = {
 }
 
 
+# Phase 5.5: Emotion → semantic-cluster hints for query augmentation.
+# When the user_state has a dominant emotion (max ≥ 0.5), appending a short
+# semantic phrase to the query before embedding shifts retrieval toward the
+# action cluster matching the emotion. See bench commit 9749029 for empirical
+# validation: stateful axis 3.60 → 6.60 on bench v3.
+EMOTION_QUERY_HINTS = {
+    "anger":        "conflict navigation repair",
+    "shame":        "wound self-blame rejection origin",
+    "fear":         "threat anxiety uncertainty safety",
+    "sadness":      "loss grief depletion",
+    "joy":          "victory completion success",
+    "trust":        "safety bond closeness",
+    "anticipation": "aliveness presence connection",
+    "surprise":     "unexpected new shift",
+    "disgust":      "rejection boundary violation",
+    "guilt":        "transgression repair agency",
+}
+
+
+def _pick_dominant_emotion(state, threshold: float = 0.5) -> str | None:
+    """Return the single dominant emotion name if max(mood_vector) >= threshold,
+    else None. Used only to pick a query-augmentation hint."""
+    if not state or not state.mood_vector:
+        return None
+    items = sorted(state.mood_vector.items(), key=lambda kv: -kv[1])
+    top_k, top_v = items[0]
+    return top_k if top_v >= threshold else None
+
+
 def _keyword_emotion_inference(query: str) -> dict[str, float]:
     q = query.lower()
     scores = {k: 0.0 for k in EMOTION_KEYS}
@@ -384,6 +413,7 @@ def retrieve_events_v3(
     delta_anchor: float = DEFAULT_DELTA_ANCHOR,
     delta_date: float = DEFAULT_DELTA_DATE,
     anchor_top_n: int = ANCHOR_TOP_N,
+    augment_query: bool = True,
 ) -> list[dict]:
     """Return top-k events with v3 conditional boosts.
 
@@ -406,7 +436,15 @@ def retrieve_events_v3(
     if not rows:
         return []
 
-    query_vec = embed_texts([query], model=embedder_model)[0]
+    # Phase 5.5: emotion-hint query augmentation. When state has a dominant
+    # emotion AND augment_query=True, append a semantic hint to the query
+    # before embed. Shifts retrieval toward the action cluster for the emotion.
+    effective_query = query
+    if augment_query and user_state is not None:
+        dom = _pick_dominant_emotion(user_state)
+        if dom and dom in EMOTION_QUERY_HINTS:
+            effective_query = f"{query} {EMOTION_QUERY_HINTS[dom]}"
+    query_vec = embed_texts([effective_query], model=embedder_model)[0]
 
     # 2. Base cosine score
     import json as _json
@@ -551,4 +589,5 @@ def retrieve_events(con: sqlite3.Connection, query: str, **kwargs) -> list[dict]
     kwargs.pop("delta_date", None)
     kwargs.pop("anchor_top_n", None)
     kwargs.pop("lam_anchor", None)
+    kwargs.pop("augment_query", None)
     return retrieve_events_v3(con, query, **kwargs)

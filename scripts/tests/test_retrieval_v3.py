@@ -132,11 +132,14 @@ def test_neutral_state_no_boosts(seed_events):
 
 
 def test_dominant_emotion_triggers_boost(seed_events):
-    """Shame-dominant state boosts shame-aligned events (22, 33)."""
+    """Shame-dominant state boosts shame-aligned events (22, 33).
+    Disables query augmentation (Phase 5.5) to isolate the emotion-alignment
+    boost from the query-shift augmentation effect."""
     con = seed_events
     shame_state = UserState(mood_vector={"shame": 0.8, "sadness": 0.4})
     out = retrieve_events_v3(con, "zasluzhivatel shame wound", top_k=4,
-                             embedder_model="fake-local", user_state=shame_state)
+                             embedder_model="fake-local", user_state=shame_state,
+                             augment_query=False)
     # Shame-aligned events (22, 33) should appear. At least one should have emotion_boost > 1.0
     boosted = [ev for ev in out if ev.get("emotion_boost", 1.0) > 1.0]
     assert boosted, f"Expected at least one event with emotion_boost > 1.0, got {out}"
