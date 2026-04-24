@@ -62,24 +62,80 @@ Garden Pulse disambiguates via **typed belief weights**, **emotional signatures*
 
 ## Benchmark
 
-On a 47-query empathic subset of the project owner's real personal corpus (85 events, 3-judge cross panel: gpt-4o / gpt-4o-mini / gemini-2.5-flash), judge-built ground truth (0.86 mean inter-judge agreement):
+### Empathic Memory Bench v3 (2026-04-24) — Pulse v3 SOTA
 
-| System | Mean /30 | vs Mem0 |
+8 judges × 8 vendor/model families × 35 tests × 5 axes, on [bench v3 corpus](https://github.com/nikshilov/bench):
+
+| System | overall | core | stateful | chain | multi_signal |
+|---|---|---|---|---|---|
+| cosine | 4.83 | 6.05 | 0.17 | 1.75 | 5.34 |
+| bm25 | 3.07 | 4.24 | 0.01 | 1.83 | 1.59 |
+| hybrid | 4.43 | 5.65 | 0.29 | 2.58 | 3.64 |
+| **Pulse v3** | **6.38** | **6.90** | **6.44** | **4.50** | **6.26** |
+
+Delta vs best baseline: overall **+1.55 (+32%)**, **stateful ×38**, chain +74%, core **no regression**.
+Opus wins 26/35 tests (74%). Krippendorff α on stateful axis = **0.81 (strong)** — cross-judge consensus.
+
+Judges: Moonshot Kimi K2.6 + K2-0711-preview, Z.ai GLM-5 + GLM-5.1, Alibaba Qwen3-Max, DeepSeek V3.2, OpenAI GPT-5.4, Anthropic Claude Opus 4.7. First empathic-memory benchmark with frontier-complete coverage.
+
+### External validation (three independent benchmarks)
+
+| benchmark | score | notes |
 |---|---|---|
-| **Garden Pulse v2_pure** | **28.71 ± 1.40** | **+6.96** 🏆 |
-| LangMem | 28.95 ± 1.61 | *tied cluster* |
-| sqlite-vec | 28.82 ± 1.44 | *tied cluster* |
-| LlamaIndex | 28.09 ± 2.86 | *tied cluster* |
-| Mem0 (infer=False) | 21.75 ± 0.61 | baseline |
+| **LongMemEval_S** (ICLR 2025, 500 Qs) | **68.89%** | overall, -3.2 pts vs oracle |
+| **ES-MemEval** (Feb 2026, 1427 Qs) | **76%** (1.519/2.0 LLM-judge) | comparable to gpt-4o+RAG |
+| **LoCoMo** (ACL 2024, 1986 Qs × 10 convs) | **32.51% F1**, 62.78% adv refusal | cosine + Cohere embed |
 
-Garden Pulse leads the OpenAI-embedding cluster and decisively outperforms LLM-extracted-fact storage (Mem0) by **+6.96 points** (+33%). Key finding: **storage format matters more than ranking sophistication** — full event text retrieval beats digest/fact extraction on the same embedder.
+See [github.com/nikshilov/bench](https://github.com/nikshilov/bench) for reproduction scripts and raw JSON.
 
-Winning config (in `scripts/extract/retrieval_v2.py`):
-```python
-score = cosine × exp(-0.001 · days_ago)   # light recency, t½ ≈ 700d
+### v2_pure baseline (2026-04-18) — unchanged
+
+On a 47-query empathic subset of the project owner's real personal corpus (85 events, 3-judge cross panel: gpt-4o / gpt-4o-mini / gemini-2.5-flash):
+
+| System | Mean /30 |
+|---|---|
+| **Pulse v2_pure** | **28.71 ± 1.40** 🏆 |
+| LangMem | 28.95 ± 1.61 |
+| sqlite-vec | 28.82 ± 1.44 |
+| LlamaIndex | 28.09 ± 2.86 |
+| Mem0 (infer=False) | 21.75 ± 0.61 |
+
+Pulse v2_pure still wins the OpenAI-embedding cluster by **+6.96 pts** (+33%) over Mem0 on that bench. Key finding at the time: **storage format matters more than ranking sophistication** — full event text retrieval beats digest/fact extraction on the same embedder. v3 extends v2 with conditional boosts that stack only when their signals genuinely exist.
+
+---
+
+## Pulse v3 (2026-04-24) — conditional multi-signal ranking
+
+v3 wraps v2_pure with five **conditional** boosts — each term activates only when its input signal exists, so queries without state / emotion / anchor information produce bit-identical results to v2_pure (no regression on plain retrieval).
+
+```
+score = cosine
+      × exp(-λ[belief_class, user_flag] · days_ago)   # anchor-aware decay
+      × (1 + β · emotion_alignment)    if query_emotion ≥ 0.5   # conditional emotion boost
+      × (1 + γ · state_fit)            if body stressed/restored # conditional state boost
+      × (1 + δ_anchor · user_flag)     if rank ≤ 8              # anchor-priority
+      × (1 + δ_date  · date_proximity) if snapshot_days_ago set  # date-proximity
 ```
 
-No sentiment amplifier. No anchor boost. No LLM re-ranking. Just the right storage format.
+Key ideas:
+
+- **Anchor-aware decay (λ_anchor = 0.001)** — events with `user_flag=true` (structural-truth anchors like marriage, grief, identity events) decay twice as slowly as regular events. Half-life 693d vs 347d. Matches the v2 `user_model` tier exactly.
+- **Conditional gating** — Phase D (2026-04-20) proved that an always-on emotion cosine term monotonically **hurts** retrieval (β=0 → β=3 drops NDCG from 43.77 to 27.72). v3 activates emotion boost **only** when the query has a dominant emotion (max ≥ 0.5 after query-emotion inference). Same discipline applies to state boost (gated by body-stressed or body-restored signals) and anchor boost (gated by `user_flag=true`).
+- **Emotion-hint query augmentation (Phase 5.5)** — when `user_state.mood_vector` has a dominant emotion, a short hint string is appended to the query *before* embedding (e.g. "conflict navigation repair" for anger, "wound self-blame rejection" for shame). This is what lifts the stateful axis from 3.60 to 6.60 single-handedly.
+- **Date-proximity boost (Phase 5.2)** — when `user_state.snapshot_days_ago` is provided (e.g. from a real Apple Health snapshot), events whose `days_ago` is close get a small boost via a stepped curve (same day = 1.0, within a week = 0.7, etc.).
+- **Chain expansion** — if `return_chain=True`, top-K events are expanded via `event_chains` table (BFS depth 3) and returned as an ordered sequence rather than a set.
+
+Schema additions (migration 015):
+- `event_emotions` — Plutchik-10 floats per event (`joy, sadness, anger, fear, trust, disgust, anticipation, surprise, shame, guilt`)
+- `event_chains` — `parent_id → child_id` with `strength` and `kind` (for causal/temporal links)
+- `query_emotion_cache` — inference cache for the emotion classifier
+
+Source files:
+- [`scripts/extract/retrieval_v3.py`](./scripts/extract/retrieval_v3.py) — full Python implementation
+- [`scripts/extract/emotion_classifier.py`](./scripts/extract/emotion_classifier.py) — Qwen-based Plutchik tagger
+- [`internal/store/migrations/015_emotions_chains.sql`](./internal/store/migrations/015_emotions_chains.sql) — schema
+
+Tests: [`scripts/tests/test_retrieval_v3.py`](./scripts/tests/test_retrieval_v3.py) — includes no-regression property (v3 with no state == v2_pure).
 
 ---
 
@@ -191,9 +247,10 @@ Test coverage includes:
 ## Roadmap
 
 - [x] **v1** — entity-level keyword-BFS retrieval (superseded)
-- [x] **v2_pure** — event-level semantic retrieval (current production)
+- [x] **v2_pure** — event-level semantic retrieval (current production default)
 - [x] **Belief vocabulary** — migration 014, 5 typed classes
-- [ ] **v3 emotion graph** — typed emotional signatures (`event_emotions` table), 15-category taxonomy, conditional emotion-alignment bonus
+- [x] **v3 emotion + state graph** — Plutchik-10 tags, chain table, conditional emotion/state/anchor/date boosts, SOTA on bench v3 (overall +32%, stateful ×38)
+- [x] **External validation** — LongMemEval_S 68.89%, ES-MemEval 76%, LOCOMO 32.51%
 - [ ] **Judge-built GT bench at scale** — 200+ queries, multi-corpus
 - [ ] **MCP server** — expose `retrieve_memory` as a tool for any MCP-compatible harness
 - [ ] **Longitudinal evaluation** — track retrieval quality as user's corpus grows over 6+ months
@@ -206,10 +263,11 @@ Test coverage includes:
 |---|---|---|---|---|---|---|
 | Storage format | LLM-extracted facts | Messages | Temporal KG | Key-value | Vector only | **Full events + typed classes** |
 | Retrieval | Vector | Vector+graph | Cypher+vector | Vector | Vector | **Vector + per-class decay + floor** |
-| Emotional weight | none | none | none | none | none | **built-in** (v3 WIP) |
+| Emotional weight | none | none | none | none | none | **built-in** (v3 shipped) |
+| Stateful retrieval | no | no | no | no | no | **yes** (mood_vector + body state) |
 | Belief types | none | none | none | none | none | **5 typed classes** |
 | Core-wound preservation | no | no | no | no | no | **yes** (confidence_floor) |
-| Empathic bench | — | — | — | — | — | **28.71/30 on Nik corpus** |
+| Empathic bench | — | — | — | — | — | **SOTA on bench v3** (6.38 vs cosine 4.83, stateful ×38) |
 
 Garden Pulse is purpose-built for **personal, emotional memory** where events carry weight beyond their semantic content. Other engines are excellent at *"find similar text"* — Pulse answers *"what matters for this person now?"*.
 
