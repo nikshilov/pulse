@@ -57,6 +57,9 @@ EMOTION_KEYS = (
 # Default boost coefficients. Kept small and conditional to avoid Phase D failure mode.
 DEFAULT_BETA = 0.15   # emotion boost cap ≈ +15%
 DEFAULT_GAMMA = 0.15  # state boost cap   ≈ +15%
+DEFAULT_DELTA_ANCHOR = 0.05  # anchor boost for user_flag=True events already in top-N (marginal)
+DEFAULT_DELTA_DATE = 0.25    # date-proximity boost cap when state.snapshot_days_ago set
+ANCHOR_TOP_N = 8             # only boost anchors that reach top-N by base score
 
 
 @dataclass
@@ -71,6 +74,7 @@ class UserState:
     stress_proxy: Optional[float] = None
     recent_life_events_7d: list[str] = field(default_factory=list)
     time_of_day: Optional[str] = None
+    snapshot_days_ago: Optional[float] = None   # state represents a specific past moment (days_ago scale)
 
     def has_dominant_emotion(self, threshold: float = 0.5) -> bool:
         if not self.mood_vector:
@@ -161,7 +165,7 @@ def _query_emotion_vec(
 EMO_KEYWORDS = {
     "joy":         ["рад", "кайф", "счаст", "joy"],
     "sadness":     ["груст", "печал", "тоск", "sad"],
-    "anger":       ["зл", "ярос", "раздраж", "бес", "anger"],
+    "anger":       ["зл", "зол", "ярос", "раздраж", "бес", "anger"],
     "fear":        ["страх", "тревог", "паник", "боюсь", "fear", "anxious"],
     "trust":       ["довер", "близос", "принят", "trust"],
     "disgust":     ["отвращ", "брезг", "disgust"],
@@ -244,6 +248,27 @@ def _compute_state_fit(event: dict, state: UserState) -> float:
             if "marriage" in label or "anya" in text or "аня" in text:
                 score = max(score, 0.7)
     return score
+
+
+def _compute_date_proximity(event_days_ago: float, state_days_ago: float) -> float:
+    """Stepped temporal proximity 0-1 — discriminates exact-day from same-week.
+
+    diff ≤ 1 → 1.0  (same day)
+    diff ≤ 3 → 0.7  (within 3 days)
+    diff ≤ 7 → 0.3  (same week)
+    else     → 0.0
+
+    Applied only when state.snapshot_days_ago is set — LME-style retrieval
+    (no snapshot date) keeps formula identical to v2_pure.
+    """
+    diff = abs(float(event_days_ago) - float(state_days_ago))
+    if diff <= 1.0:
+        return 1.0
+    if diff <= 3.0:
+        return 0.7
+    if diff <= 7.0:
+        return 0.3
+    return 0.0
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -346,6 +371,9 @@ def retrieve_events_v3(
     use_belief_class: bool = True,
     beta: float = DEFAULT_BETA,
     gamma: float = DEFAULT_GAMMA,
+    delta_anchor: float = DEFAULT_DELTA_ANCHOR,
+    delta_date: float = DEFAULT_DELTA_DATE,
+    anchor_top_n: int = ANCHOR_TOP_N,
 ) -> list[dict]:
     """Return top-k events with v3 conditional boosts.
 
@@ -396,9 +424,9 @@ def retrieve_events_v3(
         user_state.is_body_stressed() or user_state.is_body_restored()
     )
 
-    # 4. Rank with base × recency × conditional boosts
+    # 4. First pass: compute base per candidate (for anchor top-N gate)
     now = datetime.now(timezone.utc)
-    ranked: list[tuple[float, dict]] = []
+    prepared: list[tuple[float, dict, float]] = []  # (base, event, days_ago)
     for cos, event_id in candidates:
         event = _fetch_event(con, event_id)
         if event is None:
@@ -413,6 +441,24 @@ def retrieve_events_v3(
         base = cos * recency
         base = max(base, cos * floor) if floor > 0 else base
 
+        event["cosine"] = cos
+        event["days_ago"] = days_ago
+        event["effective_lambda"] = effective_lam
+        prepared.append((base, event, days_ago))
+
+    # Anchor gate: who are top-N candidates by base score (for conditional anchor boost)
+    prepared.sort(key=lambda t: -t[0])
+    anchor_eligible_ids = {
+        ev["id"] for _, ev, _ in prepared[:anchor_top_n]
+    }
+
+    apply_date = (user_state is not None and
+                  user_state.snapshot_days_ago is not None)
+
+    ranked: list[tuple[float, dict]] = []
+    for base, event, days_ago in prepared:
+        event_id = event["id"]
+
         # Emotion boost
         emo_boost = 1.0
         if apply_emotion:
@@ -426,16 +472,36 @@ def retrieve_events_v3(
             fit = _compute_state_fit(event, user_state)
             state_boost = 1.0 + gamma * fit
 
-        score = base * emo_boost * state_boost
+        # Phase 5.1: Anchor-priority boost — only for user_flag=True events
+        # that already passed the top-N base-score gate. Keeps anchor events
+        # from sliding out of top-k when adjacent non-anchor events edge ahead
+        # on cosine alone, while not dragging unrelated anchors into unrelated
+        # queries (they never enter top-N, so never get the boost).
+        anchor_boost = 1.0
+        is_anchor = bool(event.get("user_flag"))
+        if is_anchor and event_id in anchor_eligible_ids and delta_anchor > 0:
+            anchor_boost = 1.0 + delta_anchor
 
-        event["cosine"] = cos
+        # Phase 5.2: Date-proximity boost — only when state represents a
+        # specific past moment. Boosts events that happened on or near the
+        # snapshot date. Formula collapses to 1.0 for LME-style queries where
+        # snapshot_days_ago is None.
+        date_boost = 1.0
+        if apply_date:
+            prox = _compute_date_proximity(float(days_ago), float(user_state.snapshot_days_ago))
+            date_boost = 1.0 + delta_date * prox
+
+        score = base * emo_boost * state_boost * anchor_boost * date_boost
+
         event["score"] = score
-        event["days_ago"] = days_ago
-        event["effective_lambda"] = effective_lam
         if apply_emotion:
             event["emotion_boost"] = emo_boost
         if apply_state:
             event["state_boost"] = state_boost
+        if anchor_boost != 1.0:
+            event["anchor_boost"] = anchor_boost
+        if apply_date:
+            event["date_boost"] = date_boost
         ranked.append((score, event))
 
     ranked.sort(key=lambda t: t[0], reverse=True)
@@ -465,4 +531,7 @@ def retrieve_events(con: sqlite3.Connection, query: str, **kwargs) -> list[dict]
     kwargs.pop("return_chain", None)
     kwargs.pop("beta", None)
     kwargs.pop("gamma", None)
+    kwargs.pop("delta_anchor", None)
+    kwargs.pop("delta_date", None)
+    kwargs.pop("anchor_top_n", None)
     return retrieve_events_v3(con, query, **kwargs)
