@@ -204,6 +204,29 @@ EMOTION_QUERY_HINTS = {
 }
 
 
+# Phase 5.6: Temporal keyword → implicit days_ago reference. Activates
+# date-proximity boost when query contains unambiguous temporal markers.
+# STRICT list — excludes "now"/"сейчас"/"currently" which occur in
+# non-temporal emotional queries.
+TEMPORAL_KEYWORDS = [
+    (("today", "сегодня"), 0.0),
+    (("yesterday", "вчера"), 1.0),
+    (("this week", "на этой неделе", "recently", "недавно", "last few days", "за последние дни"), 3.0),
+    (("last week", "на прошлой неделе", "неделю назад"), 10.0),
+    (("this month", "в этом месяце", "этом месяце"), 15.0),
+    (("last month", "в прошлом месяце", "месяц назад"), 40.0),
+]
+
+
+def infer_query_date(query: str) -> float | None:
+    """Scan query for temporal keywords → implicit days_ago reference, or None."""
+    q = query.lower()
+    for kws, days in TEMPORAL_KEYWORDS:
+        if any(kw in q for kw in kws):
+            return days
+    return None
+
+
 def _pick_dominant_emotion(state, threshold: float = 0.5) -> str | None:
     """Return the single dominant emotion name if max(mood_vector) >= threshold,
     else None. Used only to pick a query-augmentation hint."""
@@ -506,8 +529,16 @@ def retrieve_events_v3(
         ev["id"] for _, ev, _ in prepared[:anchor_top_n]
     }
 
-    apply_date = (user_state is not None and
-                  user_state.snapshot_days_ago is not None)
+    # Phase 5.6: date boost activates on explicit snapshot_days_ago (Apple
+    # Health-style state) OR on temporal keywords in the query ("recently",
+    # "сегодня" etc.). Implicit keyword path uses strict markers — see
+    # TEMPORAL_KEYWORDS — excludes ambiguous ones like "now"/"сейчас".
+    date_ref = None
+    if user_state is not None and user_state.snapshot_days_ago is not None:
+        date_ref = user_state.snapshot_days_ago
+    else:
+        date_ref = infer_query_date(query)
+    apply_date = date_ref is not None
 
     ranked: list[tuple[float, dict]] = []
     for base, event, days_ago in prepared:
@@ -536,13 +567,12 @@ def retrieve_events_v3(
         if is_anchor and event_id in anchor_eligible_ids and delta_anchor > 0:
             anchor_boost = 1.0 + delta_anchor
 
-        # Phase 5.2: Date-proximity boost — only when state represents a
-        # specific past moment. Boosts events that happened on or near the
-        # snapshot date. Formula collapses to 1.0 for LME-style queries where
-        # snapshot_days_ago is None.
+        # Phase 5.2 + 5.6: Date-proximity boost — active when state has
+        # snapshot_days_ago (Apple Health) OR when query carries a temporal
+        # keyword ("recently"/"сегодня"). date_ref resolved above.
         date_boost = 1.0
-        if apply_date:
-            prox = _compute_date_proximity(float(days_ago), float(user_state.snapshot_days_ago))
+        if apply_date and date_ref is not None:
+            prox = _compute_date_proximity(float(days_ago), float(date_ref))
             date_boost = 1.0 + delta_date * prox
 
         score = base * emo_boost * state_boost * anchor_boost * date_boost
