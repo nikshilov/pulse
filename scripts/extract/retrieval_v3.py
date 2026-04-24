@@ -61,6 +61,15 @@ DEFAULT_DELTA_ANCHOR = 0.05  # anchor boost for user_flag=True events already in
 DEFAULT_DELTA_DATE = 0.25    # date-proximity boost cap when state.snapshot_days_ago set
 ANCHOR_TOP_N = 8             # only boost anchors that reach top-N by base score
 
+# Phase 5.4: anchor-aware decay. user_flag=True events are structural truths
+# (marriage anchors, zasluzhivatel, communication rules) and should not fade
+# with recency. Half-life ~693d for anchors vs ~347d for regular events.
+# Matches Pulse v2 BELIEF_DECAY tier convention: self_model=0.0005 (axiom-like),
+# we pick 0.001 as conservative middle-ground — aggressive enough to preserve
+# old marriage-anchor events but not so eternal that stale anchors dominate
+# recent moments.
+DEFAULT_LAMBDA_ANCHOR = 0.001
+
 
 @dataclass
 class UserState:
@@ -366,6 +375,7 @@ def retrieve_events_v3(
     user_state: UserState | None = None,
     return_chain: bool = False,
     lam: float = DEFAULT_LAMBDA,
+    lam_anchor: float = DEFAULT_LAMBDA_ANCHOR,
     embedder_model: str = DEFAULT_EMBEDDER,
     top_n_candidates: int = DEFAULT_TOP_N_CANDIDATES,
     use_belief_class: bool = True,
@@ -432,7 +442,13 @@ def retrieve_events_v3(
         if event is None:
             continue
         days_ago = _days_since(event.get("ts"), now) or 30
-        if use_belief_class:
+        # Phase 5.4: anchor-aware decay — user_flag=True events use the slower
+        # lam_anchor rate (structural anchors shouldn't age like day-to-day
+        # moments). Falls back to per-belief-class decay for non-anchors.
+        is_anchor_event = bool(event.get("user_flag"))
+        if is_anchor_event:
+            effective_lam = lam_anchor
+        elif use_belief_class:
             effective_lam = BELIEF_DECAY.get(event.get("belief_class", "operational"), lam)
         else:
             effective_lam = lam
@@ -534,4 +550,5 @@ def retrieve_events(con: sqlite3.Connection, query: str, **kwargs) -> list[dict]
     kwargs.pop("delta_anchor", None)
     kwargs.pop("delta_date", None)
     kwargs.pop("anchor_top_n", None)
+    kwargs.pop("lam_anchor", None)
     return retrieve_events_v3(con, query, **kwargs)
