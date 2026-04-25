@@ -86,6 +86,40 @@ def test_budget_exhausted_skips_extraction(seeded_db, capsys):
     assert state == "pending"
 
 
+def test_source_kind_filter_only_processes_matching_jobs(seeded_db, monkeypatch):
+    from unittest.mock import MagicMock
+
+    con = sqlite3.connect(seeded_db)
+    con.execute("""INSERT INTO observations
+        (id, source_kind, source_id, content_hash, version, scope, captured_at, observed_at, actors, content_text, metadata, raw_json)
+        VALUES (2, 'claude_cleaned_md', 'clean:1', 'h2', 1, 'shared',
+                '2026-04-15T00:00:00Z', '2026-04-15T00:00:01Z',
+                '[{"kind":"user","id":"nik"}]', 'Garden boundary memory', '{}', '{}')""")
+    con.execute("""INSERT INTO extraction_jobs
+        (id, observation_ids, state, attempts, created_at, updated_at)
+        VALUES (2, '[2]', 'pending', 0, '2026-04-15T00:00:01Z', '2026-04-15T00:00:01Z')""")
+    con.commit()
+    con.close()
+
+    fake_triage = MagicMock(return_value=([{"verdict": "skip", "reason": "test"}], MOCK_USAGE))
+    monkeypatch.setattr(pulse_extract, "call_sonnet_triage", fake_triage)
+    monkeypatch.setattr(pulse_extract, "call_opus_extract", MagicMock())
+
+    pulse_extract.run_once(
+        str(seeded_db),
+        budget_usd_remaining=10.0,
+        source_kind="claude_cleaned_md",
+        max_jobs=10,
+    )
+
+    con = sqlite3.connect(seeded_db)
+    raw_state = con.execute("SELECT state FROM extraction_jobs WHERE id=1").fetchone()[0]
+    cleaned_state = con.execute("SELECT state FROM extraction_jobs WHERE id=2").fetchone()[0]
+    con.close()
+    assert raw_state == "pending"
+    assert cleaned_state == "done"
+
+
 def test_relations_and_facts_persisted(seeded_db, monkeypatch):
     from unittest.mock import MagicMock
     import sqlite3

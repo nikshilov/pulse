@@ -86,6 +86,27 @@ python pulse_manual_extract.py apply \
 - опционально создаёт `fake-local` embeddings для новых events, чтобы проверить retrieval plumbing без API-стоимости;
 - поддерживает ручные `event_emotions` и `event_chains` по event title/id.
 
+### import_cleaned_chats.py — Импорт очищенных Claude dumps
+
+Импортирует markdown-дампы после `clean_claude_project_dumps.py` как chunked observations.
+Это предпочтительный вход для полного memory extraction по Claude Code истории: сырые JSONL
+хранят каждое промежуточное сообщение агента, а cleaned markdown держит только User/Assistant
+и режется на устойчивые чанки по turn boundaries.
+
+```bash
+python import_cleaned_chats.py \
+  --db ~/pulse.db \
+  --path ~/OpenClawWorkspace/chat-exports/claude-projects-cleaned \
+  --max-chars 12000
+
+set -a; source ../.env; set +a
+python pulse_extract.py \
+  --db ~/pulse.db \
+  --source-kind claude_cleaned_md \
+  --max-jobs 30 \
+  --budget 3.0
+```
+
 ### pulse_consolidate.py — Обогащение графа
 
 Периодическая консолидация: чистка, обогащение, метрики, care-messages.

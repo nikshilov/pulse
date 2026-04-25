@@ -667,7 +667,13 @@ def _save_metrics(con: sqlite3.Connection, job_id: int, usage: dict) -> None:
     )
 
 
-def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
+def run_once(
+    db_path: str,
+    budget_usd_remaining: float = 10.0,
+    *,
+    source_kind: str | None = None,
+    max_jobs: int = 10,
+) -> int:
     con = _open_connection(db_path)
 
     try:
@@ -688,10 +694,20 @@ def run_once(db_path: str, budget_usd_remaining: float = 10.0) -> int:
             )
             return 0
 
-        jobs = con.execute(
-            "SELECT id, observation_ids FROM extraction_jobs "
-            "WHERE state='pending' ORDER BY created_at LIMIT 10"
-        ).fetchall()
+        if source_kind:
+            jobs = con.execute(
+                "SELECT j.id, j.observation_ids FROM extraction_jobs j "
+                "JOIN observations o ON j.observation_ids = printf('[%d]', o.id) "
+                "WHERE j.state='pending' AND o.source_kind=? "
+                "ORDER BY j.created_at LIMIT ?",
+                (source_kind, max_jobs),
+            ).fetchall()
+        else:
+            jobs = con.execute(
+                "SELECT id, observation_ids FROM extraction_jobs "
+                "WHERE state='pending' ORDER BY created_at LIMIT ?",
+                (max_jobs,),
+            ).fetchall()
         if not jobs:
             print("no pending jobs")
             return 0
@@ -791,8 +807,10 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--db", required=True)
     p.add_argument("--budget", type=float, default=float(os.getenv("PULSE_DAILY_EXTRACT_BUDGET_USD", "10")))
+    p.add_argument("--source-kind", help="Only process one-observation jobs for this observations.source_kind")
+    p.add_argument("--max-jobs", type=int, default=10, help="Maximum pending jobs to claim in this run")
     args = p.parse_args()
-    return run_once(args.db, args.budget)
+    return run_once(args.db, args.budget, source_kind=args.source_kind, max_jobs=args.max_jobs)
 
 
 if __name__ == "__main__":
