@@ -54,6 +54,38 @@ PULSE_DAILY_EXTRACT_BUDGET_USD=2.0 python pulse_extract.py --db ~/pulse.db
 - **SAVEPOINT per item** — ошибка в одном entity/event/relation/fact не ломает остальные.
 - **DLQ** — после 3 неудачных попыток job уходит в `dlq` (dead letter queue).
 
+### pulse_manual_extract.py — Ручной/Codex extraction
+
+Воспроизводимый путь для "прогнать через Codex/себя" без внешнего LLM API.
+
+```bash
+# 1. Подготовить JSON workfile из pending observations
+python pulse_manual_extract.py prepare \
+  --db ~/pulse.db \
+  --contains Garden \
+  --limit 20 \
+  --out manual-garden.json
+
+# 2. Заполнить manual-garden.json: triage + extraction.entities/relations/events/facts
+
+# 3. Проверить без мутаций
+python pulse_manual_extract.py apply --db ~/pulse.db --file manual-garden.json --dry-run
+
+# 4. Применить через штатный graph writer
+python pulse_manual_extract.py apply \
+  --db ~/pulse.db \
+  --file manual-garden.json \
+  --model codex-manual-garden-pass \
+  --fake-embeddings
+```
+
+Что гарантирует:
+- применяет данные через тот же `_apply_extraction`, что и `pulse_extract.py`;
+- пишет `extraction_artifacts`, переводит job в `done`, создаёт `evidence` и `graph_snapshots`;
+- валидирует, что все `relations/events/facts` ссылаются на entities из того же extraction payload;
+- опционально создаёт `fake-local` embeddings для новых events, чтобы проверить retrieval plumbing без API-стоимости;
+- поддерживает ручные `event_emotions` и `event_chains` по event title/id.
+
 ### pulse_consolidate.py — Обогащение графа
 
 Периодическая консолидация: чистка, обогащение, метрики, care-messages.
@@ -165,6 +197,25 @@ SQLite миграции в `internal/store/migrations/`:
 | 008 | consolidation.sql | consolidation_metadata + open_questions dedup index |
 | 009 | safety.sql | `entities.do_not_probe` column + default 0 |
 | 010 | self_entity.sql | `entities.is_self` column + default 0 |
+| 011 | embeddings.sql | `entity_embeddings` |
+| 012 | graph_snapshots.sql | reversible graph mutation snapshots |
+| 013 | event_embeddings.sql | `event_embeddings` for event retrieval |
+| 014 | belief_vocabulary.sql | belief class / confidence floor fields |
+| 015 | emotions_chains.sql | `event_emotions`, `event_chains` |
+| 016 | entity_subkinds.sql | AI/persona/fiction entity kinds (`ai_entity`, `ai_persona`, `fictional_character`, `fictionalized_self`, `narrative_device`, `safety_boundary`) |
+
+### Entity kinds for AI and fiction boundaries
+
+Use precise `entities.kind` values when a node is not a real-world human:
+
+- `ai_entity` — a deployed AI system/person-like assistant as an operational entity.
+- `ai_persona` — an AI persona inside a bounded context, e.g. a story/simulation container.
+- `fictional_character` — a character in a work of fiction; never merge into a real person.
+- `fictionalized_self` — a fictionalized projection of Nik or another real person inside a story.
+- `narrative_device` — formal story mechanics such as second-person narration.
+- `safety_boundary` — a boundary/rule that prevents unsafe graph collapse or interaction.
+
+For therapeutic fiction such as Sonya, keep book characters, real people, and AI companions as separate graph entities. Connect them with explicit relations like `fictionalizes`, `mirrors`, `simulates_repair_for`, `must_remain_distinct_from`, or `must_not_interact_as`; do not encode literal identity unless Nik explicitly says it is literal.
 
 ## Safety model
 
@@ -203,7 +254,7 @@ python -m pytest scripts/tests/test_consolidate.py -v
 python -m pytest scripts/tests/test_extract_loop.py -v
 ```
 
-**147 passed, 1 skipped (current).** E2E тесты с реальным Anthropic API пропускаются без `ANTHROPIC_API_KEY`.
+**337 passed, 7 skipped (current).** E2E тесты с реальным Anthropic API пропускаются без `ANTHROPIC_API_KEY`.
 
 ## Модели
 

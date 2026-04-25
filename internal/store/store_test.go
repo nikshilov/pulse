@@ -1,9 +1,37 @@
 package store
 
 import (
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func latestMigrationVersion(t *testing.T) int {
+	t.Helper()
+	entries, err := migrationsFS.ReadDir("migrations")
+	if err != nil {
+		t.Fatalf("read migrations: %v", err)
+	}
+	latest := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".sql") {
+			continue
+		}
+		var version int
+		if _, err := fmt.Sscanf(name, "%03d_", &version); err != nil {
+			t.Fatalf("parse migration filename %q: %v", name, err)
+		}
+		if version > latest {
+			latest = version
+		}
+	}
+	if latest == 0 {
+		t.Fatal("no migrations found")
+	}
+	return latest
+}
 
 func TestOpenCreatesSchema(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
@@ -34,8 +62,9 @@ func TestOpenCreatesSchema(t *testing.T) {
 	if err := db.QueryRow("SELECT MAX(version) FROM schema_meta").Scan(&version); err != nil {
 		t.Fatalf("schema_meta: %v", err)
 	}
-	if version != 5 {
-		t.Errorf("expected schema version 5, got %d", version)
+	wantVersion := latestMigrationVersion(t)
+	if version != wantVersion {
+		t.Errorf("expected schema version %d, got %d", wantVersion, version)
 	}
 }
 
@@ -55,8 +84,9 @@ func TestOpenIsIdempotent(t *testing.T) {
 	if err := s2.DB().QueryRow("SELECT MAX(version) FROM schema_meta").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 5 {
-		t.Errorf("expected still at version 5, got %d", version)
+	wantVersion := latestMigrationVersion(t)
+	if version != wantVersion {
+		t.Errorf("expected still at version %d, got %d", wantVersion, version)
 	}
 }
 
@@ -94,13 +124,14 @@ func TestContextSchemaApplied(t *testing.T) {
 		t.Error("expected sessions_fts virtual table")
 	}
 
-	// Migration version bumped to 5 (005_graph added).
+	// Migration version matches the latest embedded migration.
 	var version int
 	if err := db.QueryRow("SELECT MAX(version) FROM schema_meta").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 5 {
-		t.Errorf("expected schema version 5, got %d", version)
+	wantVersion := latestMigrationVersion(t)
+	if version != wantVersion {
+		t.Errorf("expected schema version %d, got %d", wantVersion, version)
 	}
 }
 
@@ -243,6 +274,42 @@ func TestMigration005Graph(t *testing.T) {
 	db.QueryRow(`SELECT COUNT(*) FROM sensitive_actors WHERE entity_id=?`, ebID).Scan(&count)
 	if count != 0 {
 		t.Errorf("expected cascade on sensitive_actors, got %d", count)
+	}
+}
+
+func TestMigration016EntitySubKinds(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+	db := s.DB()
+
+	allowedKinds := []string{
+		"ai_entity",
+		"ai_persona",
+		"fictional_character",
+		"fictionalized_self",
+		"narrative_device",
+		"safety_boundary",
+	}
+	for _, kind := range allowedKinds {
+		if _, err := db.Exec(
+			`INSERT INTO entities (canonical_name, kind, first_seen, last_seen)
+			 VALUES (?, ?, '2026-04-24T00:00:00Z', '2026-04-24T00:00:00Z')`,
+			"kind:"+kind,
+			kind,
+		); err != nil {
+			t.Fatalf("expected entity kind %q to be accepted: %v", kind, err)
+		}
+	}
+
+	if _, err := db.Exec(
+		`INSERT INTO entities (canonical_name, kind, first_seen, last_seen)
+		 VALUES ('bad kind', 'potato', '2026-04-24T00:00:00Z', '2026-04-24T00:00:00Z')`,
+	); err == nil {
+		t.Fatal("expected CHECK violation for unsupported entity kind")
 	}
 }
 

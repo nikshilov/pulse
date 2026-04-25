@@ -17,13 +17,19 @@ def test_extract_tool_entity_has_required_fields():
     assert entity_schema["properties"]["kind"]["enum"] == ENTITY_KINDS
 
 
-def test_extract_tool_entity_kind_enum_has_10_values():
-    assert len(ENTITY_KINDS) == 10
+def test_extract_tool_entity_kind_enum_has_expected_values():
+    assert len(ENTITY_KINDS) == 16
     assert "person" in ENTITY_KINDS
     assert "product" in ENTITY_KINDS
     assert "community" in ENTITY_KINDS
     assert "skill" in ENTITY_KINDS
     assert "concept" in ENTITY_KINDS
+    assert "ai_entity" in ENTITY_KINDS
+    assert "ai_persona" in ENTITY_KINDS
+    assert "fictional_character" in ENTITY_KINDS
+    assert "fictionalized_self" in ENTITY_KINDS
+    assert "narrative_device" in ENTITY_KINDS
+    assert "safety_boundary" in ENTITY_KINDS
 
 
 def test_triage_tool_has_required_structure():

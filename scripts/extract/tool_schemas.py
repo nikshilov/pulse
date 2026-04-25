@@ -3,6 +3,8 @@
 ENTITY_KINDS = [
     "person", "place", "project", "org", "product",
     "community", "skill", "concept", "thing", "event_series",
+    "ai_entity", "ai_persona", "fictional_character", "fictionalized_self",
+    "narrative_device", "safety_boundary",
 ]
 
 EXTRACT_TOOL = {
