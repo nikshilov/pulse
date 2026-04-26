@@ -64,7 +64,7 @@ Garden Pulse disambiguates via **typed belief weights**, **emotional signatures*
 
 ### Empathic Memory Bench v3 (2026-04-24) — Pulse v3 SOTA
 
-8 judges × 8 vendor/model families × 35 tests × 5 axes, on [bench v3 corpus](https://github.com/nikshilov/bench):
+8 LLM judges × 8 model checkpoints (6 vendor families) × 35 tests × 5 axes, on [bench v3 corpus](https://github.com/nikshilov/bench):
 
 | System | overall | core | stateful | chain | multi_signal |
 |---|---|---|---|---|---|
@@ -73,10 +73,10 @@ Garden Pulse disambiguates via **typed belief weights**, **emotional signatures*
 | hybrid | 4.43 | 5.65 | 0.29 | 2.58 | 3.64 |
 | **Pulse v3** | **6.38** | **6.90** | **6.44** | **4.50** | **6.26** |
 
-Delta vs best baseline: overall **+1.55 (+32%)**, **stateful ×38**, chain +74%, core **no regression**.
+Delta vs best baseline per axis: overall **+1.55 (+32% vs cosine)**, **stateful +6.15 (×22 vs hybrid / ×38 vs cosine)**, chain +1.92 (+74% vs hybrid), core +0.85 (no regression vs cosine).
 Opus wins 26/35 tests (74%). Krippendorff α on stateful axis = **0.81 (strong)** — cross-judge consensus.
 
-Judges: Moonshot Kimi K2.6 + K2-0711-preview, Z.ai GLM-5 + GLM-5.1, Alibaba Qwen3-Max, DeepSeek V3.2, OpenAI GPT-5.4, Anthropic Claude Opus 4.7. First empathic-memory benchmark with frontier-complete coverage.
+Judges: Moonshot Kimi K2.6 + K2-0711-preview, Z.ai GLM-5 + GLM-5.1, Alibaba Qwen3-Max, DeepSeek V3.2, OpenAI GPT-5.4, Anthropic Claude Opus 4.7 — 8 model checkpoints across 6 vendor families.
 
 ### External validation (three independent benchmarks)
 
@@ -85,6 +85,8 @@ Judges: Moonshot Kimi K2.6 + K2-0711-preview, Z.ai GLM-5 + GLM-5.1, Alibaba Qwen
 | **LongMemEval_S** (ICLR 2025, 500 Qs) | **68.89%** | overall, -3.2 pts vs oracle |
 | **ES-MemEval** (Feb 2026, 1427 Qs) | **76%** (1.519/2.0 LLM-judge) | comparable to gpt-4o+RAG |
 | **LoCoMo** (ACL 2024, 1986 Qs × 10 convs) | **32.51% F1**, 62.78% adv refusal | cosine + Cohere embed |
+
+These three are run with **Pulse v2_pure** — the cosine-plus-recency baseline Pulse v3 collapses to when no state / emotion / anchor signals are provided (none of the external datasets carry those fields). v3 == v2_pure on this data by construction, so the external numbers validate Pulse's *foundation*, not v3's conditional boosts specifically (those are validated only on bench v3's stateful / chain / multi-signal axes, which is what empathic-memory bench v3 exists for).
 
 See [github.com/nikshilov/bench](https://github.com/nikshilov/bench) for reproduction scripts and raw JSON.
 
@@ -249,7 +251,7 @@ Test coverage includes:
 - [x] **v1** — entity-level keyword-BFS retrieval (superseded)
 - [x] **v2_pure** — event-level semantic retrieval (current production default)
 - [x] **Belief vocabulary** — migration 014, 5 typed classes
-- [x] **v3 emotion + state graph** — Plutchik-10 tags, chain table, conditional emotion/state/anchor/date boosts, SOTA on bench v3 (overall +32%, stateful ×38)
+- [x] **v3 emotion + state graph** — Plutchik-10 tags, chain table, conditional emotion/state/anchor/date boosts, SOTA on bench v3 (overall +32% vs cosine, stateful ×22 vs hybrid)
 - [x] **External validation** — LongMemEval_S 68.89%, ES-MemEval 76%, LOCOMO 32.51%
 - [ ] **Judge-built GT bench at scale** — 200+ queries, multi-corpus
 - [ ] **MCP server** — expose `retrieve_memory` as a tool for any MCP-compatible harness
@@ -267,7 +269,7 @@ Test coverage includes:
 | Stateful retrieval | no | no | no | no | no | **yes** (mood_vector + body state) |
 | Belief types | none | none | none | none | none | **5 typed classes** |
 | Core-wound preservation | no | no | no | no | no | **yes** (confidence_floor) |
-| Empathic bench | — | — | — | — | — | **SOTA on bench v3** (6.38 vs cosine 4.83, stateful ×38) |
+| Empathic bench | — | — | — | — | — | **SOTA on bench v3** (6.38 overall vs cosine 4.83; stateful ×22 vs hybrid / ×38 vs cosine) |
 
 Garden Pulse is purpose-built for **personal, emotional memory** where events carry weight beyond their semantic content. Other engines are excellent at *"find similar text"* — Pulse answers *"what matters for this person now?"*.
 
