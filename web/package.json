@@ -1,0 +1,24 @@
+{
+  "name": "pulse-chat-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pulse chat UI — vanilla TypeScript + custom elements demo for state-aware retrieval",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --format=esm --target=es2022 --minify --sourcemap --outfile=dist/app.js",
+    "dev": "node ./dev-server.mjs",
+    "watch": "esbuild src/main.ts --bundle --format=esm --target=es2022 --sourcemap --watch --outfile=dist/app.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
