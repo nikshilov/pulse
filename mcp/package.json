@@ -1,0 +1,50 @@
+{
+  "name": "@nikshilov/pulse-mcp",
+  "version": "0.1.0",
+  "description": "Pulse memory engine as MCP server — state-aware empathic memory for AI companions",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "pulse-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "memory",
+    "empathic-memory",
+    "ai-companion",
+    "stateful-retrieval",
+    "pulse"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nikshilov/pulse.git",
+    "directory": "mcp"
+  },
+  "bugs": {
+    "url": "https://github.com/nikshilov/pulse/issues"
+  },
+  "homepage": "https://github.com/nikshilov/pulse#readme"
+}
