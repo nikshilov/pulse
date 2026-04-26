@@ -13,6 +13,7 @@ import (
 	"github.com/nkkmnk/pulse/internal/ingest"
 	"github.com/nkkmnk/pulse/internal/outbox"
 	"github.com/nkkmnk/pulse/internal/prompt"
+	"github.com/nkkmnk/pulse/internal/retrieve"
 	"github.com/nkkmnk/pulse/internal/store"
 )
 
@@ -29,6 +30,9 @@ type Config struct {
 	Claude       ClaudeAPI
 	DefaultModel string
 	Store        *store.Store
+	// Retrieval is the Phase G hybrid engine. Optional — when nil the
+	// /retrieve endpoint is not registered.
+	Retrieval *retrieve.Engine
 }
 
 // Server wraps the chi router.
@@ -57,6 +61,9 @@ func (s *Server) Handler() http.Handler {
 	r.Post("/msg", s.handleMsg)
 	if s.cfg.Store != nil {
 		r.Method(http.MethodPost, "/ingest", ingest.NewHandler(s.cfg.Store))
+	}
+	if s.cfg.Retrieval != nil {
+		r.Post("/retrieve", s.handleRetrieve)
 	}
 	return r
 }

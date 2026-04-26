@@ -12,6 +12,7 @@ import (
 	"github.com/nkkmnk/pulse/internal/claude"
 	"github.com/nkkmnk/pulse/internal/outbox"
 	"github.com/nkkmnk/pulse/internal/prompt"
+	"github.com/nkkmnk/pulse/internal/retrieve"
 )
 
 type outboxRow struct {
@@ -142,4 +143,64 @@ func (s *Server) handleMsg(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// retrieveRequest is the JSON body for POST /retrieve.
+type retrieveRequest struct {
+	Query     string             `json:"query"`
+	Mode      string             `json:"mode,omitempty"` // "auto" | "factual" | "empathic" | "chain"
+	TopK      int                `json:"top_k,omitempty"`
+	UserState *retrieve.UserState `json:"user_state,omitempty"`
+}
+
+type retrieveResponse struct {
+	EventIDs   []int64 `json:"event_ids"`
+	ModeUsed   string  `json:"mode_used"`
+	Confidence float64 `json:"confidence"`
+	Classifier string  `json:"classifier"`
+	Reasoning  string  `json:"reasoning,omitempty"`
+}
+
+// handleRetrieve serves POST /retrieve. Body: retrieveRequest. Returns
+// ranked event IDs + router decision metadata.
+func (s *Server) handleRetrieve(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.Retrieval == nil {
+		http.Error(w, "retrieval not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var req retrieveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Query) == "" {
+		http.Error(w, "query is required", http.StatusBadRequest)
+		return
+	}
+	mode := retrieve.QueryMode(req.Mode)
+	if mode == "" {
+		mode = retrieve.ModeAuto
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	resp, err := s.cfg.Retrieval.Retrieve(ctx, retrieve.RetrieveRequest{
+		Query:     req.Query,
+		Mode:      mode,
+		TopK:      req.TopK,
+		UserState: req.UserState,
+	})
+	if err != nil {
+		slog.Error("retrieve failed", "err", err)
+		http.Error(w, "retrieval error", http.StatusInternalServerError)
+		return
+	}
+	out := retrieveResponse{
+		EventIDs:   resp.EventIDs,
+		ModeUsed:   string(resp.ModeUsed),
+		Confidence: resp.RouterDecision.Confidence,
+		Classifier: resp.RouterDecision.Classifier,
+		Reasoning:  resp.RouterDecision.Reasoning,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
 }
