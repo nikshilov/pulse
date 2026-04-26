@@ -48,7 +48,7 @@ export class RouterLog extends HTMLElement {
       .map((e) => {
         const t = new Date(e.ts).toTimeString().slice(0, 5);
         const why = `${e.classifier} ${e.confidence.toFixed(2)} · ${shortQuery(e.query)}`;
-        return `<div class="entry"><span class="time">${t}</span><span class="mode">${e.mode}</span><span class="why" title="${escapeAttr(e.reasoning ?? '')}">${escapeAttr(why)}</span></div>`;
+        return `<div class="entry"><span class="time">${t}</span><span class="mode" data-mode="${escapeAttr(e.mode)}">${escapeAttr(e.mode)}</span><span class="why" title="${escapeAttr(e.reasoning ?? '')}">${escapeAttr(why)}</span></div>`;
       })
       .join('');
     this.innerHTML = `

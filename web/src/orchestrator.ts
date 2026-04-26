@@ -13,6 +13,7 @@
 import type { PulseClient } from './api.js';
 import type { ClaudeAdapter } from './llm.js';
 import type { AppState } from './state.js';
+import { pulseBurst } from './components/heart-pulse.js';
 
 interface OrchestratorDeps {
   pulse: PulseClient;
@@ -48,6 +49,7 @@ async function onComposerSend(ev: Event): Promise<void> {
 
   let retrieval;
   try {
+    pulseBurst(); // heart "speeds up" while we retrieve
     retrieval = await pulse.recall({
       query: text,
       mode: 'auto',

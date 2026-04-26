@@ -22,7 +22,9 @@ export class MemoryRow extends HTMLElement {
   private render(): void {
     if (!this._retrieval) return;
     const r = this._retrieval;
-    const summary = `▾ memory used (${r.event_ids.length} event${r.event_ids.length === 1 ? '' : 's'}, mode: ${r.mode_used})`;
+    const arrow = this.expanded ? '▴' : '▾';
+    const count = `${r.event_ids.length} event${r.event_ids.length === 1 ? '' : 's'}`;
+    const modeIcon = MODE_ICONS[r.mode_used] ?? '✨';
     const rows = r.event_ids
       .map(
         (id, i) =>
@@ -30,7 +32,6 @@ export class MemoryRow extends HTMLElement {
       )
       .join('');
     const meta = [
-      `mode: ${r.mode_used}`,
       `classifier: ${r.classifier}`,
       `confidence: ${r.confidence.toFixed(2)}`,
       r.reasoning ? `why: ${escapeHTML(r.reasoning)}` : '',
@@ -39,7 +40,10 @@ export class MemoryRow extends HTMLElement {
       .join('  •  ');
 
     this.innerHTML = `
-      <button type="button" class="toggle" aria-expanded="${this.expanded}">${escapeHTML(summary)}</button>
+      <button type="button" class="toggle" aria-expanded="${this.expanded}">
+        ${arrow} memory used <span style="opacity:0.6">·</span> ${escapeHTML(count)}
+        <span class="mode-badge" data-mode="${escapeHTML(r.mode_used)}">${modeIcon} ${escapeHTML(r.mode_used)}</span>
+      </button>
       <div class="body" ${this.expanded ? '' : 'hidden'}>
         ${rows}
         <div class="meta">${meta}</div>
@@ -53,18 +57,16 @@ export class MemoryRow extends HTMLElement {
 
   private toggleExpand(): void {
     this.expanded = !this.expanded;
-    if (this.body) {
-      if (this.expanded) this.body.removeAttribute('hidden');
-      else this.body.setAttribute('hidden', '');
-    }
-    if (this.toggle) {
-      this.toggle.setAttribute('aria-expanded', String(this.expanded));
-      const arrow = this.expanded ? '▴' : '▾';
-      const summary = this.toggle.textContent ?? '';
-      this.toggle.textContent = arrow + summary.slice(1);
-    }
+    this.render();
   }
 }
+
+const MODE_ICONS: Record<string, string> = {
+  factual: '📑',
+  empathic: '💗',
+  chain: '⛓',
+  auto: '✨',
+};
 
 function escapeHTML(s: string): string {
   return s

@@ -35,6 +35,13 @@ export class ChatMessage extends HTMLElement {
     // Plain text for now; markdown rendering is Phase I.4 polish
     this.bubble.textContent = this._message.text || '…';
 
+    // Streaming-cursor flag drives the blinking pipe via CSS
+    if (this._message.streaming) {
+      this.dataset.streaming = 'true';
+    } else {
+      delete this.dataset.streaming;
+    }
+
     // Inject <memory-row> for assistant messages once retrieval attached
     if (
       this._message.role === 'assistant' &&

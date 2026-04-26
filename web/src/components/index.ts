@@ -9,8 +9,10 @@ import { ChatMessage } from './chat-message.js';
 import { MemoryRow } from './memory-row.js';
 import { StatePanel } from './state-panel.js';
 import { RouterLog } from './router-log.js';
+import { HeartPulse } from './heart-pulse.js';
 
 export function registerComponents(): void {
+  customElements.define('heart-pulse', HeartPulse);
   customElements.define('composer-bar', ComposerBar);
   customElements.define('chat-thread', ChatThread);
   customElements.define('chat-message', ChatMessage);
@@ -19,4 +21,6 @@ export function registerComponents(): void {
   customElements.define('router-log', RouterLog);
 }
 
-export { ComposerBar, ChatThread, ChatMessage, MemoryRow, StatePanel, RouterLog };
+export {
+  HeartPulse, ComposerBar, ChatThread, ChatMessage, MemoryRow, StatePanel, RouterLog,
+};
