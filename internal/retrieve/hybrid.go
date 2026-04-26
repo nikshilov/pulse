@@ -7,10 +7,18 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/nkkmnk/pulse/internal/embed"
 	"github.com/nkkmnk/pulse/internal/store"
 )
+
+// Embedder is the minimal interface Engine needs from a vector embedder.
+// Production callers pass a *embed.CohereClient; tests pass a fake.
+type Embedder interface {
+	Embed(ctx context.Context, texts []string, inputType embed.InputType) ([][]float32, error)
+	Model() string
+}
 
 // Engine is Phase G hybrid retrieval. Loads events, facts, and chains from
 // the store into in-memory caches at Init(); per-query it dispatches to
@@ -22,7 +30,7 @@ import (
 // boosts to match the Python prototype.
 type Engine struct {
 	store    *store.Store
-	embedder *embed.CohereClient
+	embedder Embedder
 	router   *Router
 
 	// Decay constants (mirrors Python defaults from retrieval_v3.py:444-446).
@@ -46,14 +54,18 @@ type Engine struct {
 	parentToChild map[int64][]int64
 	childToParent map[int64][]int64
 
-	embedModel string
+	embedModel    string
+	referenceTime time.Time
 }
 
 // Config bundles the dependencies an Engine needs.
 type Config struct {
 	Store    *store.Store
-	Embedder *embed.CohereClient
+	Embedder Embedder
 	Router   *Router // optional; if nil, Engine creates a default one
+	// ReferenceTime — if set, days_ago is computed as
+	// (ReferenceTime - event.ts) / 24h. Defaults to time.Now() at Init().
+	ReferenceTime *time.Time
 }
 
 // New builds an Engine with sensible defaults. Call Init() to load indexes.
@@ -66,6 +78,10 @@ func New(cfg Config) *Engine {
 	if cfg.Embedder != nil {
 		model = cfg.Embedder.Model()
 	}
+	ref := time.Now()
+	if cfg.ReferenceTime != nil {
+		ref = *cfg.ReferenceTime
+	}
 	return &Engine{
 		store:             cfg.Store,
 		embedder:          cfg.Embedder,
@@ -73,6 +89,7 @@ func New(cfg Config) *Engine {
 		decayLambda:       0.002,
 		decayLambdaAnchor: 0.001,
 		embedModel:        model,
+		referenceTime:     ref,
 		parentToChild:     make(map[int64][]int64),
 		childToParent:     make(map[int64][]int64),
 	}
@@ -96,16 +113,20 @@ func (e *Engine) Init(ctx context.Context) error {
 	return nil
 }
 
-// loadEvents pulls (id, days_ago, user_flag, emotion_vec, embedding) per event.
+// loadEvents pulls (id, ts, embedding, emotion_vec) per event.
 // Joins events ⨝ event_embeddings ⨝ event_emotions. Events without embedding
 // are skipped (can't be retrieved by cosine). Events without emotion get
 // zero-vector (no emotion boost).
+//
+// days_ago is computed at load time as (referenceTime - ts) / 24h.
+// Anchor flag (user_flag) is not in the production events schema yet —
+// defaults to false; bench corpora set it via a sidecar table or future
+// migration.
 func (e *Engine) loadEvents(ctx context.Context) error {
 	q := `
 SELECT
     e.id,
-    COALESCE(e.days_ago, 0) AS days_ago,
-    COALESCE(e.user_flag, 0) AS user_flag,
+    e.ts,
     ee.vector_json,
     COALESCE(em.joy, 0), COALESCE(em.sadness, 0), COALESCE(em.anger, 0),
     COALESCE(em.fear, 0), COALESCE(em.trust, 0), COALESCE(em.disgust, 0),
@@ -130,11 +151,10 @@ ORDER BY e.id`
 
 	for rows.Next() {
 		var id int64
-		var days float64
-		var anchor int
+		var tsStr string
 		var vecJSON string
 		em := make([]float32, 10)
-		if err := rows.Scan(&id, &days, &anchor, &vecJSON,
+		if err := rows.Scan(&id, &tsStr, &vecJSON,
 			&em[0], &em[1], &em[2], &em[3], &em[4],
 			&em[5], &em[6], &em[7], &em[8], &em[9]); err != nil {
 			return err
@@ -143,13 +163,37 @@ ORDER BY e.id`
 		if err := json.Unmarshal([]byte(vecJSON), &v); err != nil {
 			return fmt.Errorf("event %d: parse vector_json: %w", id, err)
 		}
+		days := computeDaysAgo(tsStr, e.referenceTime)
 		e.eventIDs = append(e.eventIDs, id)
 		e.eventVecs = append(e.eventVecs, v)
 		e.eventDays = append(e.eventDays, days)
-		e.eventAnchor = append(e.eventAnchor, anchor != 0)
+		// Anchor flag not yet in production schema — default false
+		e.eventAnchor = append(e.eventAnchor, false)
 		e.eventEmo = append(e.eventEmo, em)
 	}
 	return rows.Err()
+}
+
+// computeDaysAgo parses a timestamp (ISO8601 / RFC3339) and returns the
+// distance to ref in fractional days. Falls back to 0 on parse failure.
+func computeDaysAgo(tsStr string, ref time.Time) float64 {
+	if tsStr == "" {
+		return 0
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano, time.RFC3339,
+		"2006-01-02T15:04:05Z", "2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+	} {
+		if t, err := time.Parse(layout, tsStr); err == nil {
+			d := ref.Sub(t).Hours() / 24.0
+			if d < 0 {
+				return 0
+			}
+			return d
+		}
+	}
+	return 0
 }
 
 func (e *Engine) loadFacts(ctx context.Context) error {
