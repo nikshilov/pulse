@@ -56,6 +56,63 @@ Output: a **curiosity manifest** — 3-5 ranked threads the Cartographer would n
 
 Prompt: `prompts/curiosity.md` (NEW, this phase).
 
+### Shadow inference (periodic, end of session or every 30-50 turns) — Phase K.0.5
+
+**Therapy works through resistance.** The user thinks one thing about themselves; the cartographer sees another in patterns. Shadow inference is the structural representation of that gap — a held asymmetry the companion can use to know where to listen harder, where to hold silence, where NOT to push.
+
+Hard line: **shadow material is never autofired into conversation**. It biases the companion's system prompt. The user only sees it when they explicitly open the shadow drawer on their map (consent-first reveal, not push).
+
+Inputs:
+- Current profile (full)
+- Existing `shadow_material[]` (with cooldowns and last_attempt outcomes)
+- Recent 30-50 turns
+- Known `defense_repertoire[]`
+- `_resistance_observed[]` accumulated by continuous extractor
+
+Outputs (per item):
+- `what_companion_sees` — 1-2 sentence behavioral pattern, NOT theory label
+- `what_user_says_instead` — verbatim defense quote
+- `pattern_evidence` — minimum 3 events
+- `defense_type` — from controlled enum (humor, freeze, intellectualization, dismissal, topic_shift, anger_deflection, "i'm fine", productivity_armor, rationalization, philosophizing, self_diagnosis, performance, care-taking)
+- `readiness_to_approach` — 0..1 (how close user is to seeing this themselves)
+- `approach_strategy` — through body / through mirror-the-defense / through third-person carrier / through held silence — NEVER "directly point out the pattern"
+- `do_not_approach_if` — guardrails (recent crisis, short session, defense saturation)
+- `last_attempt` + `cooldown_until`
+
+Companion-side usage: shadow material is injected into system prompt as held-asymmetry awareness. Example bias:
+
+```
+[Cartographer's shadow map for this user]
+
+[ready: 0.45 — hold, don't approach]
+- pattern: User talks about wife's coldness; pattern shows freeze learned
+  age 5 (pretending to sleep around father).
+- approach: through body — when he describes freezing, ask 'where in
+  body before silence'. Don't link to childhood directly.
+
+[ready: 0.85 — about to land it himself]
+- pattern: linking every romantic disappointment to "я недостаточно хорош";
+  in last 3 sessions started questioning the link.
+- approach: hold silence the next time he says it. Don't reflect back as
+  truth. Wait.
+
+[cooldown active until 2026-05-04]
+- pattern: dismisses his music ("это хуйня") whenever it gets praised.
+- last attempt 2 days ago: full deflection. Wait 5 days, then try
+  mirror-defense approach.
+```
+
+The companion reads this as **bias**, not as a script. Most turns she does nothing with it. When she chooses to lean in, she does so through the prescribed approach — and never through interpretation.
+
+Prompt: `prompts/shadow_inference.md` (NEW, Phase K.0.5).
+
+Model: **Claude Sonnet 4.6** (NOT Haiku — pattern recognition across 30-50 turns requires it).
+Cost: ~$0.04 per call. Cadence: end of session, OR every 30-50 turns, OR on demand.
+
+### Resistance signal collection (every turn) — Phase K.0.5
+
+The continuous extractor (every turn) does NOT promote patterns to shadow material. But it DOES record `_resistance_observed[]` markers — moments where user pivoted away from emotional material, fired a default defense, or used self-diagnosis as closure. Shadow inference reads these as the primary substrate (≥3 occurrences before promotion). See `prompts/continuous.md` for the resistance marker taxonomy.
+
 ## Schema
 
 Canonical machine-readable schema lives in `schema.yaml`. It is a direct port of the v3 JSON output ([example: `examples/nik_v3_profile.json`](examples/nik_v3_profile.json)) with these promotions to first-class fields:
@@ -136,6 +193,19 @@ When the continuous extractor patches a field during a chat:
 - A "+1" particle floats up from the chip
 - If a foggy chip just got its first evidence — bigger reveal animation (~2.5s) with sound option
 
+### Shadow drawer (NEW — Phase K.0.5)
+
+Closed by default in the map's corner. Opens on user click — that click is the **act of consent** to see what the cartographer sees but hasn't said. Inside:
+
+- A list of shadow_material items with:
+  - The pattern in plain language (`what_companion_sees`)
+  - The user's own contradicting quote (`what_user_says_instead`) right next to it
+  - A **readiness slider** showing 0..1 — visual: small light moves along a dim track. "I'm not for you yet" / "We can approach together" / "You're almost there yourself".
+  - The approach strategy — phrased to the user: "I'd come at this through your body, not through naming" / "I'll hold silence next time you're near it"
+- High-divergence nodes on the main map (where `surface_summary` differs from `summary`) get a subtle double-outline — but the user has to open the drawer to see WHAT the divergence is.
+
+The drawer is honest, not accusatory. It says "here's what I'm holding for you." It doesn't say "here's what's wrong with you."
+
 ### Demo arc (for Twitter clip)
 
 1. Empty mosaic — most tiles small, foggy chips throughout (initial state for new user)
@@ -143,6 +213,7 @@ When the continuous extractor patches a field during a chat:
 3. Cartographer fires; mosaic UI shows: relationship-tile grows, triggers-tile grows, attachment-tile grows
 4. New chips appear: "fight with X partner" (filled), "freeze response" (filled), "what makes them feel chosen" (dashed — curiosity)
 5. **Voice-over moment**: "the companion now knows three more things than five minutes ago — and she knows what she'd love to ask next"
+6. **(K.0.5 addition)** User clicks the shadow drawer — sees one item: pattern with wife mirrors a childhood pattern with father; slider at 0.45 ("I'm holding this; not for now"). User reads, closes drawer. Map keeps glowing softly — nothing was forced on them.
 
 ## Implementation pipeline
 

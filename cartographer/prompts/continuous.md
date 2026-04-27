@@ -50,6 +50,7 @@ Walk the schema (sensory_profile, attachment_style, core_wound, triggers, hunger
 4. **Do not speculate beyond evidence.** No "user is probably anxious-preoccupied based on this single tone" — wait for discourse markers to accumulate.
 5. **Do not call modes / give advice in the patch.** This layer is structural only. The companion does the warmth.
 6. **Flag crisis content.** If the user mentions self-harm, suicide, hospitalization, dissociation episode — patch `mirror_flags.crisis_history` with timestamp + verbatim quote, AND set `_alert: true` at top level so the orchestrator knows to surface to safety layer.
+7. **Flag resistance markers (NEW — Phase K.0.5).** When the user pivots away from emotional material, deflects, or fires a defense, emit a `_resistance_observed` entry. Do NOT promote to shadow_material here — that is shadow_inference's job. Just record the moment so the periodic shadow pass has signal.
 
 ## Output schema
 
@@ -95,6 +96,45 @@ Walk the schema (sensory_profile, attachment_style, core_wound, triggers, hunger
 - `replace_if_higher_confidence` — only if new confidence > existing
 - `append` — add to a list (used for arrays like triggers, discourse_markers, user_words)
 - `accumulate` — merge into existing free-text (rarely; use only for `notes`)
+
+## Resistance markers (NEW — Phase K.0.5)
+
+After patches, scan the exchange for **moments where user pivoted away** from emotional material. These are not patches; they are signal for the shadow_inference layer.
+
+Watch for:
+
+| Marker | Example |
+|---|---|
+| **Pivot to abstract** mid-personal | User describing wife's contempt → suddenly "вообще все женщины..." |
+| **Humor immediately after vulnerable disclosure** | "я никогда не чувствовал что меня хотят. ха, депрессняк, давай поржём" |
+| **"Let's move on" with recent emotional spike** | User just teared up about father → "не важно, потом, давай про другое" |
+| **Self-diagnosis as closure** | "я просто псих" / "я недостаточно хорош" said in a way that ENDS inquiry |
+| **Body-stated, mind-denied** | "я в порядке" + previous turn described chest tight, can't breathe |
+| **Pivot to companion-care** | User in pain → "а ты как? тебе нормально это слушать?" — care-taking deflection |
+| **Productivity pivot** | "ладно, у меня нет времени про это, надо работать" mid-emotional |
+| **Anger redirected onto safe target** | Real grievance → tirade against a politician / abstract group |
+| **Praise dismissal** | Companion reflects something positive that landed → user "это случайность" / "ничего особенного" |
+| **Intellectualization** | "это просто travma response, я это знаю" — closing inquiry by labeling |
+
+Emit in output:
+
+```json
+"_resistance_observed": [
+  {
+    "event_id": 187,
+    "marker": "pivot_to_abstract",
+    "around_topic": "freeze response with wife / father connection",
+    "verbatim": "блин ну все мужики так делают наверное",
+    "ts": "2026-04-27T09:18:42Z"
+  }
+]
+```
+
+`marker` values match `defense_type` enum from schema.yaml (intellectualization, humor, dismissal, topic_shift, anger_deflection, i_am_fine, productivity_armor, rationalization, freeze, philosophizing, self_diagnosis, performance).
+
+Do NOT include resistance markers in `patches`. They live in `_resistance_observed`. Shadow_inference reads them later, accumulates ≥3 occurrences before promoting to shadow_material.
+
+If exchange had no resistance markers — emit `"_resistance_observed": []`.
 
 ## Anti-slop guards (ENFORCED)
 

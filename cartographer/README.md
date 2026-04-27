@@ -10,8 +10,9 @@ Phase K of Pulse — the **Cartographer**: a continuously-updating, scientifical
 | [`schema.yaml`](schema.yaml) | Canonical machine-readable user-profile schema (v1.0.0). Single source of truth for Go structs, DB migration, and visualization rendering. |
 | [`prompts/onboarding_ru.md`](prompts/onboarding_ru.md) | Cartographer onboarding prompt, Russian (ported from Garden v3, validated on real user) |
 | [`prompts/onboarding_en.md`](prompts/onboarding_en.md) | Cartographer onboarding prompt, English (XML-formatted v4) |
-| [`prompts/continuous.md`](prompts/continuous.md) | Post-turn extractor — runs after each user-companion exchange, patches profile JSON |
+| [`prompts/continuous.md`](prompts/continuous.md) | Post-turn extractor — runs after each user-companion exchange, patches profile JSON. Also collects resistance markers (K.0.5) |
 | [`prompts/curiosity.md`](prompts/curiosity.md) | Gap analyzer — produces 3-5 ranked threads the Cartographer wants to lean into next |
+| [`prompts/shadow_inference.md`](prompts/shadow_inference.md) | Shadow-pattern reflector (K.0.5) — runs periodically across 30-50 turns, identifies patterns the user lives but does not name. Outputs `shadow_material[]` + `defense_repertoire[]` updates. Sonnet 4.6. |
 | [`examples/nik_v3_profile.json`](examples/nik_v3_profile.json) | Reference output JSON from a real cartographer session (Nik Shilov, March 2026). Use as fixture for tests. |
 
 ## Status
@@ -33,11 +34,12 @@ Total ~25h focused work after K.0.
 
 The schema, the onboarding prompt, the methodology stack (MI / PACS / DCM / ASMR / self-distancing) are the result of **Deep Research + 2 user tests on a real person** that ran in March 2026. The reference JSON in `examples/` is from that user. **We do not redesign these. We port and extend.**
 
-Phase K extends the canon with three additions the original did not have:
+Phase K extends the canon with four additions the original did not have:
 
 1. **Continuous mode** — schema fills not just from the onboarding session but from every subsequent conversation
 2. **Curiosity engine** — explicit gap analysis that biases the companion's system prompt without forcing questionnaires
 3. **Map visualization** — the user can see their map filling, which is itself a delight-loop that keeps people engaged
+4. **Shadow layer (K.0.5)** — therapy works through resistance. The user thinks one thing about themselves; the companion sees another. The shadow layer holds that gap structurally: surface vs. observed divergence per field, `shadow_material[]` for inferred patterns the user has not yet named, `defense_repertoire[]` for habitual deflections, resistance markers in continuous mode, conservative readiness/cooldown logic so the companion holds silence by default and never autofires shadow into conversation.
 
 ## Scientific provenance
 

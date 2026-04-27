@@ -103,6 +103,30 @@ areas:
       summary:
         type: text
         description: 2-4 sentences in third person. Companion's working theory.
+      surface_summary:
+        type: text
+        nullable: true
+        description: |
+          What the user CONSCIOUSLY says about the wound when asked directly.
+          Often differs from `summary` — that's the point. Stored separately
+          so divergence is visible. Example: surface_summary "у меня всё
+          нормально с отцом" while summary captures "father used him as
+          shield, learned freeze-as-survival, re-enacts in marriage".
+      divergence_score:
+        type: float
+        range: [0, 1]
+        nullable: true
+        description: |
+          How much surface_summary diverges from observed pattern (summary).
+          0 = aligned (user sees themselves clearly).
+          0.5 = partial — user names the pattern when prompted but resists daily.
+          1 = full denial — user actively says opposite of what pattern shows.
+          Used by visualization to highlight high-divergence nodes; used by
+          companion's system prompt to know where holding-not-pushing matters.
+      divergence_evidence:
+        type: list[event_id]
+        nullable: true
+        description: Specific turns where surface and pattern visibly diverged.
       user_words:
         type: list[quote]
         description: Verbatim sentences from user that approximate or articulate the wound.
@@ -217,6 +241,136 @@ cross_cutting:
   notes:
     type: text
     description: Free-text observations not captured in structured fields. The Cartographer's working notebook.
+
+  # ─────────────────────────────────────────────────────────────────
+  # Shadow layer (NEW — Phase K.0.5)
+  # ─────────────────────────────────────────────────────────────────
+  #
+  # Therapy works through resistance. The user thinks one thing about
+  # themselves; the companion sees another in patterns. This is the
+  # structural representation of that gap. NOT a weapon — a held
+  # asymmetry. Companion never accuses, never "interprets out loud" until
+  # readiness is high. Shadow is for the companion's system-prompt bias
+  # and for the user's map (drawer, opt-in to view).
+  #
+  # Provenance: IFS exiles, Jung shadow, MI "develop discrepancy", PACS
+  # incoherent narrative markers. NOT psychoanalytic interpretation.
+  # NEVER autofired confrontations.
+
+  shadow_material:
+    description: |
+      Patterns the cartographer observes the user enacting but not
+      naming/owning. Each item is a held tension, not a verdict.
+    is_array: true
+    item:
+      id: {type: string, description: "Stable ULID for cross-references"}
+      what_companion_sees:
+        type: text
+        description: |
+          Pattern in 1-2 sentences. Specific, behavioral, evidence-grounded.
+          NOT "user is anxious-attached" — that's labeling. Rather:
+          "When wife shows contempt, user freezes and pretends to sleep —
+          same response he learned at age 5 hiding from father."
+      what_user_says_instead:
+        type: text
+        nullable: true
+        description: |
+          Verbatim quote OR summary of the user's stated narrative on the
+          same topic. The defense in the user's own words. e.g. "блять
+          она просто меня не любит, всё, я устал".
+      pattern_evidence:
+        type: list[event_id]
+        description: Minimum 3 events showing the pattern. Single-event flags do not become shadow items.
+      defense_type:
+        type: enum
+        values:
+          - intellectualization        # "это просто travma response, я знаю"
+          - humor                      # "а, ну хули, такая жизнь, ха-ха"
+          - dismissal                  # "не важно", "забудь"
+          - topic_shift                # рывок в abstract / в чужую историю
+          - anger_deflection           # rage redirected onto safe target
+          - i_am_fine                  # "всё норм, просто устал"
+          - productivity_armor         # "у меня нет времени про это"
+          - rationalization            # "она же это из-за работы делает, не специально"
+          - freeze                     # silence, dissociation
+          - philosophizing             # "вообще все люди это делают"
+          - self_diagnosis             # "я просто псих" — closes inquiry by labeling
+          - performance                # "я в порядке, давай помогу тебе"
+      readiness_to_approach:
+        type: float
+        range: [0, 1]
+        description: |
+          How close the user is to seeing this themselves.
+          0.0 = brittle armor. Don't approach. Wait months.
+          0.3 = stable defense; can be held in companion's awareness, NOT
+                surfaced.
+          0.6 = crumbling — user contradicts themselves on this, opens
+                cracks.
+          0.85 = user is naming pieces. Hold silence near it; let them
+                land it.
+          0.95 = user is about to say it themselves. Companion's job is
+                to NOT step on the moment.
+      approach_strategy:
+        type: text
+        description: |
+          HOW the cartographer plans to be present near this. Tools, not
+          confrontation. Examples:
+          - "Через тело — когда описывает freeze, спросить 'где в теле
+             перед тем как замолчал'. Не назвать паттерн словами."
+          - "Через чужую историю — рассказать как кто-то другой описывал
+             это, оставить тишину. Не применять к нему."
+          - "Через зеркало defense — повторить буквально его 'это же
+             хуйня', спросить 'что в категории не-хуйни'."
+          NEVER: "directly point out the pattern", "interpret aloud",
+          "ask why he does it".
+      do_not_approach_if:
+        type: list[text]
+        nullable: true
+        description: |
+          Conditions under which approach is harmful right now. e.g.
+          "if user mentions suicidal ideation in last 7 days",
+          "if session is brief (<5 turns)", "if user already named two
+          other defenses today — saturation".
+      last_attempt:
+        type: object
+        nullable: true
+        fields:
+          ts: {type: timestamp}
+          method: {type: text, description: "What approach was tried"}
+          outcome:
+            type: enum
+            values:
+              - opened_partially       # user moved closer to seeing it
+              - accepted               # user named it themselves
+              - deflected              # default defense fired, no progress
+              - escalated_resistance   # defense intensified, harm to trust
+              - dissociated            # too close to wound, user shut down
+              - skipped                # user explicitly said not now
+          cooldown_until:
+            type: timestamp
+            description: |
+              Don't attempt this shadow approach again until this date.
+              Default cooldown after deflected: 5 days. After
+              escalated_resistance: 14 days. After dissociated: 30 days.
+              After accepted: clear cooldown, item readiness raised.
+      first_seen: {type: timestamp}
+      last_updated: {type: timestamp}
+
+  defense_repertoire:
+    description: |
+      Catalog of THIS user's habitual defenses. Not all defenses listed
+      in `defense_type` enum will apply to every user. Knowing which 2-4
+      a person actually uses lets the companion recognize them as they
+      fire — and not push the same wall twice in a row.
+    is_array: true
+    item:
+      defense_type: {type: enum, values: same_as_shadow_material.defense_type}
+      frequency: {type: enum, values: [primary, secondary, occasional, rare]}
+      typical_trigger: {type: text, description: "Topic / state that fires it"}
+      typical_phrasing: {type: list[quote], description: "Verbatim phrases user uses when this fires"}
+      what_it_protects: {type: text, nullable: true, description: "If known — what wound is being shielded"}
+      first_observed: {type: timestamp}
+      last_observed: {type: timestamp}
 
 # ─────────────────────────────────────────────────────────────────────
 # Per-value envelope (NEW for Phase K)
