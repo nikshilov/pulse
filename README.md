@@ -273,6 +273,20 @@ Garden Pulse is purpose-built for **personal, emotional memory** where events ca
 
 ---
 
+## Sister projects
+
+Pulse is the engine. It does not include a chat UI, a profile builder, or a narrative companion — those live in their own repos so each can evolve at its own speed.
+
+| Repo | What | Depends on Pulse? |
+|---|---|---|
+| **[hearth](https://github.com/nikshilov/hearth)** | Generic emotional chat client + cartographer (natural-language profile builder with shadow layer). Vanilla TypeScript, MIT, self-hosted. | Yes — HTTP `/retrieve` `/ingest` |
+| **[bench](https://github.com/nikshilov/bench)** | Empathic Memory Bench — 245 stateful queries × 7 judges. The validation harness behind the SOTA numbers above. | No (uses Pulse adapter for runs) |
+| **[Garden](https://github.com/nikshilov/Garden)** | Narrative-companion product (iOS + backend + narrative engine). Specific product for self-study through story; not generic chat. | Yes (uses Pulse for memory) |
+
+If you want a chat client to try Pulse on your own conversations, start with **Hearth**. If you want to reproduce the bench numbers, go to **bench**.
+
+---
+
 ## Contributing
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) *(coming soon)*.
