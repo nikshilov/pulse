@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0f0f10" />
+    <title>pulse lab</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="lab-header">
+      <div class="lab-brand">
+        <h1 class="lab-title">pulse <span class="lab-sub">lab</span></h1>
+        <span class="lab-tag">state-aware retrieval — flip a slider, see retrieval flip</span>
+      </div>
+      <div class="lab-actions">
+        <button data-act="randomize" title="randomize state vector">randomize state</button>
+        <button data-act="reset" title="reset state vector to neutral">reset</button>
+      </div>
+    </header>
+
+    <main class="lab-main">
+      <section class="pane pane-left" aria-label="Corpus">
+        <corpus-inspector></corpus-inspector>
+      </section>
+
+      <section class="pane pane-center" aria-label="Retrieve">
+        <retrieve-panel></retrieve-panel>
+      </section>
+
+      <aside class="pane pane-right" aria-label="State">
+        <state-controls></state-controls>
+      </aside>
+    </main>
+
+    <footer class="lab-footer">
+      <span>pulse engine — state-aware empathic memory retrieval</span>
+      <span class="lab-foot-right">
+        <a href="https://github.com/nikshilov/pulse" target="_blank">github</a>
+        <span class="lab-sep">·</span>
+        <a href="https://github.com/nikshilov/hearth" target="_blank">hearth (chat client)</a>
+        <span class="lab-sep">·</span>
+        <a href="https://github.com/nikshilov/bench" target="_blank">bench</a>
+      </span>
+    </footer>
+
+    <script type="module" src="/dist/app.js"></script>
+  </body>
+</html>

@@ -283,7 +283,11 @@ Pulse is the engine. It does not include a chat UI, a profile builder, or a narr
 | **[bench](https://github.com/nikshilov/bench)** | Empathic Memory Bench — 245 stateful queries × 7 judges. The validation harness behind the SOTA numbers above. | No (uses Pulse adapter for runs) |
 | **[Garden](https://github.com/nikshilov/Garden)** | Narrative-companion product (iOS + backend + narrative engine). Specific product for self-study through story; not generic chat. | Yes (uses Pulse for memory) |
 
-If you want a chat client to try Pulse on your own conversations, start with **Hearth**. If you want to reproduce the bench numbers, go to **bench**.
+In-tree:
+
+- **[`lab/`](./lab/)** — zero-config browser playground that demonstrates state-aware retrieval. 50 fixture events, mood/biometric sliders, instant re-ranking. Pure JS simulator (no Go binary needed) but preserves the v3 scoring shape. The 30-second viral clip lives here: flip a slider, watch top-5 flip.
+
+If you want a chat client to try Pulse on your own conversations, start with **Hearth**. If you want to reproduce the bench numbers, go to **bench**. If you just want to *see* the engine breathe — open `lab/`.
 
 ---
 
