@@ -1,20 +1,29 @@
-# Pulse MCP
+# @nikshilov/pulse-mcp
 
-Pulse memory engine as an MCP server. Drop-in install for any MCP-compatible client (Claude Desktop, Cursor, mcp-agent, …).
+MCP server for [Pulse](https://github.com/nikshilov/pulse) — salience-aware empathic-memory engine. Drop-in install for any MCP-compatible client (Claude Desktop, Cursor, mcp-agent, …).
 
 State-aware empathic memory for AI companions. Pulse hybrid retrieval beats Mem0 on stateful axes by ×2.75 (R@3 on `empathic-memory-bench-v3`) and wins Mem0 on every "real" question category on LoCoMo (ACL 2024). [Full leaderboard](https://github.com/nikshilov/bench/blob/main/paper/leaderboard.md).
 
 ## Install
 
 ```bash
-npx @nikshilov/pulse-mcp
+npm i -g @nikshilov/pulse-mcp
 ```
 
-That's the whole client side. You also need a running Pulse engine — see [pulse server quickstart](https://github.com/nikshilov/pulse#quickstart). Once Pulse runs locally on `127.0.0.1:18789`, this MCP server hands queries to it.
+Or run on demand via `npx @nikshilov/pulse-mcp`. The MCP server is a thin wrapper — you also need a running Pulse engine. See [pulse server quickstart](https://github.com/nikshilov/pulse#quickstart). Once Pulse runs locally on `127.0.0.1:18789`, this MCP server hands queries to it.
 
-## Claude Desktop config
+## Configuration
 
-`~/Library/Application Support/Claude/claude_desktop_config.json`:
+### Environment variables
+
+| Variable | Default | Required | Meaning |
+|---|---|---|---|
+| `PULSE_BASE_URL` | `http://127.0.0.1:18789` | no | URL of Pulse HTTP engine |
+| `PULSE_API_KEY` | _(empty)_ | yes (in production) | Sent as `X-Pulse-Key` header. Match Pulse server's `IPC_SECRET`. |
+
+### Claude Desktop
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%/Claude/claude_desktop_config.json` (Windows):
 
 ```json
 {
@@ -33,7 +42,7 @@ That's the whole client side. You also need a running Pulse engine — see [puls
 
 Restart Claude Desktop. The three Pulse tools (`pulse_recall`, `pulse_ingest`, `pulse_state`) appear under MCP tools.
 
-## Cursor / mcp-agent config
+### Cursor / mcp-agent / other clients
 
 Same `command + args + env` pattern. See [MCP docs](https://modelcontextprotocol.io/quickstart) for client-specific syntax.
 
@@ -47,20 +56,28 @@ Retrieve memories from Pulse. Returns `event_ids` ranked by hybrid retrieval.
 |---|---|---|---|
 | query | string | _required_ | The user query |
 | mode | `auto` \| `factual` \| `empathic` \| `chain` | `auto` | Router decides if `auto`. Force one mode by name. |
-| top_k | integer 1-50 | 5 | How many events to return |
+| top_k | integer 1–50 | 5 | How many events to return |
 | user_state | object | _none_ | Current user biometric/mood snapshot. Fields: `mood_vector` (Plutchik-10), `sleep_quality`, `hrv`, `hr_trend`, `hrv_trend`, `stress_proxy`, `recent_life_events_7d`, `snapshot_days_ago` |
 
-**Use `mode='empathic'` for "how was I feeling X days ago" / "what weighs on me right now"** — Pulse's strength. Use `mode='factual'` for date/name/list lookups (Pulse closes 50% of the gap to Mem0's atomic-fact extraction here). Use `mode='chain'` for "why did X lead to Y" causal traces.
+**Use `mode='empathic'`** for "how was I feeling X days ago" / "what weighs on me right now" — Pulse's strength.
+**Use `mode='factual'`** for date/name/list lookups (Pulse closes 50% of the gap to Mem0's atomic-fact extraction here).
+**Use `mode='chain'`** for "why did X lead to Y" causal traces.
 
-**Returned event_ids** are Pulse-internal stable identifiers. Pair with a separate `pulse_get_event` lookup (coming in v0.2) to fetch full event text.
+Returned `event_ids` are Pulse-internal stable identifiers. Pair with a separate `pulse_get_event` lookup (coming in v0.2) to fetch full event text.
 
 ### `pulse_ingest(text, ts?, scope?)`
 
-Add an observation. Pulse asynchronously extracts entities, emotion tags, and (when configured) atomic facts.
+Add an observation to Pulse's memory. Pulse asynchronously extracts entities, emotion tags, and (when configured) atomic facts.
+
+| param | type | default | meaning |
+|---|---|---|---|
+| text | string | _required_ | Text content to ingest |
+| ts | string (ISO8601) | now | Observation timestamp |
+| scope | `nik` \| `elle` \| `shared` | `shared` | Memory scope partition |
 
 ### `pulse_state()` _(stub in v0.1)_
 
-Returns the most recent biometric / mood snapshot. Currently returns `unimplemented` until Pulse server adds `GET /state` (Phase H follow-up). Track at https://github.com/nikshilov/pulse/issues.
+Returns the most recent biometric / mood snapshot. Currently returns `unimplemented` until Pulse server adds `GET /state` (Phase H follow-up). Track at [github.com/nikshilov/pulse/issues](https://github.com/nikshilov/pulse/issues).
 
 ## Why Pulse?
 
@@ -77,8 +94,8 @@ npm run dev    # tsx hot reload from src/
 npm run build  # tsc → dist/
 ```
 
-To publish a new version: bump `version` in `package.json`, run `npm publish --access public`.
+To publish a new version: bump `version` in `package.json`, run `npm publish` (the `publishConfig.access: public` field handles scoping automatically).
 
 ## License
 
-MIT.
+MIT — see [LICENSE](./LICENSE).
