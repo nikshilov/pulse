@@ -182,6 +182,20 @@ go build -o bin/pulse ./cmd/pulse
 pip install openai anthropic
 ```
 
+### One-line dev workflow (Make)
+
+```bash
+make build       # compile bin/pulse
+make test        # Go (./...) + Python (scripts/tests/)
+make run         # start the server on 127.0.0.1:18789
+make demo        # ingest -> retrieve end-to-end (see examples/03-end-to-end)
+make help        # list all targets
+```
+
+Runnable examples live in [`examples/`](./examples/) — three minimal
+Python scripts (stdlib only) demonstrating ingest, retrieval, and a
+chained end-to-end demo against a running server.
+
 ### Initialize the graph
 
 ```bash
@@ -277,7 +291,8 @@ Garden Pulse is purpose-built for **personal, emotional memory** where events ca
 
 ## Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) *(coming soon)*.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for dev setup, test commands,
+code style, and PR guidelines. Runnable examples in [`examples/`](./examples/).
 
 Issue tracker: https://github.com/nikshilov/pulse/issues
 
