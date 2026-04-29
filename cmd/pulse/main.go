@@ -17,6 +17,7 @@ import (
 	"github.com/nkkmnk/pulse/internal/claude"
 	"github.com/nkkmnk/pulse/internal/config"
 	"github.com/nkkmnk/pulse/internal/embed"
+	"github.com/nkkmnk/pulse/internal/health"
 	"github.com/nkkmnk/pulse/internal/outbox"
 	"github.com/nkkmnk/pulse/internal/prompt"
 	"github.com/nkkmnk/pulse/internal/retrieve"
@@ -77,6 +78,13 @@ func run(dataDir, addr string) error {
 		slog.Warn("retrieval init failed; /retrieve will return 503", "error", err)
 	}
 
+	// Apple Health snapshot provider. M0 = static fixture so demos +
+	// Hearth integration can develop without the Mac→VDS bridge (which
+	// is broken since 2026-04-21 and 5-6h to repair). Anchor at startup
+	// so the demo's "today" stays consistent during a single process
+	// lifetime.
+	healthProvider := health.NewFixtureProvider(time.Now())
+
 	srv, err := server.New(server.Config{
 		IPCSecret:    cfg.IPCSecret,
 		Outbox:       ob,
@@ -85,6 +93,7 @@ func run(dataDir, addr string) error {
 		DefaultModel: defaultModel,
 		Store:        s,
 		Retrieval:    retrievalEngine,
+		Health:       healthProvider,
 	})
 	if err != nil {
 		return err

@@ -8,6 +8,7 @@ is a single Python file (stdlib only — no extra deps) plus a README.
 | 01 | [`01-basic-ingest/`](./01-basic-ingest/) | POST 5 sample events to `/ingest` |
 | 02 | [`02-retrieve/`](./02-retrieve/) | Query `/retrieve` with optional `UserState` |
 | 03 | [`03-end-to-end/`](./03-end-to-end/) | Ingest -> retrieve in one run |
+| 04 | [`04-health-snapshot/`](./04-health-snapshot/) | GET `/health/snapshot` (mock Apple Health) |
 
 ## Common prerequisites
 

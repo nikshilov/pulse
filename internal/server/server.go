@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/nkkmnk/pulse/internal/claude"
+	"github.com/nkkmnk/pulse/internal/health"
 	"github.com/nkkmnk/pulse/internal/ingest"
 	"github.com/nkkmnk/pulse/internal/outbox"
 	"github.com/nkkmnk/pulse/internal/prompt"
@@ -33,6 +34,10 @@ type Config struct {
 	// Retrieval is the Phase G hybrid engine. Optional — when nil the
 	// /retrieve endpoint is not registered.
 	Retrieval *retrieve.Engine
+	// Health provides Apple Health snapshots for GET /health/snapshot.
+	// Optional — when nil the route returns 503. In M0 a fixture
+	// provider is wired in cmd/pulse/main.go.
+	Health health.Provider
 }
 
 // Server wraps the chi router.
@@ -56,6 +61,9 @@ func (s *Server) Handler() http.Handler {
 	r := chi.NewRouter()
 	r.Use(s.authMiddleware)
 	r.Get("/health", s.handleHealth)
+	// /health/snapshot is a sibling under /health — chi's tree routing
+	// disambiguates against /health (exact match wins).
+	r.Get("/health/snapshot", s.handleHealthSnapshot)
 	r.Get("/outbox", s.handleOutboxList)
 	r.Post("/outbox/ack", s.handleOutboxAck)
 	r.Post("/msg", s.handleMsg)
