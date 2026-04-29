@@ -5,7 +5,7 @@ Listens to Telegram messages from a specific user, POSTs them to Pulse,
 and polls the outbox to deliver replies.
 
 Required env:
-  PULSE_URL         e.g. http://127.0.0.1:3800
+  PULSE_URL         e.g. http://127.0.0.1:18789
   PULSE_SECRET      contents of ~/.pulse/secret.key
   TG_API_ID         Telegram API id
   TG_API_HASH       Telegram API hash

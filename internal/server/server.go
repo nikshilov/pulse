@@ -62,9 +62,10 @@ func (s *Server) Handler() http.Handler {
 	if s.cfg.Store != nil {
 		r.Method(http.MethodPost, "/ingest", ingest.NewHandler(s.cfg.Store))
 	}
-	if s.cfg.Retrieval != nil {
-		r.Post("/retrieve", s.handleRetrieve)
-	}
+	// /retrieve is always registered. handleRetrieve responds with 503 when
+	// the engine is not configured (e.g. no Cohere API key) — better UX than
+	// 404 since callers can tell intent vs absence.
+	r.Post("/retrieve", s.handleRetrieve)
 	return r
 }
 

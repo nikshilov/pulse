@@ -9,20 +9,23 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/nkkmnk/pulse/internal/claude"
 	"github.com/nkkmnk/pulse/internal/config"
+	"github.com/nkkmnk/pulse/internal/embed"
 	"github.com/nkkmnk/pulse/internal/outbox"
 	"github.com/nkkmnk/pulse/internal/prompt"
+	"github.com/nkkmnk/pulse/internal/retrieve"
 	"github.com/nkkmnk/pulse/internal/server"
 	"github.com/nkkmnk/pulse/internal/store"
 )
 
 const (
-	defaultAddr  = "127.0.0.1:3800"
+	defaultAddr  = "127.0.0.1:18789"
 	defaultModel = "claude-opus-4-6"
 )
 
@@ -66,6 +69,14 @@ func run(dataDir, addr string) error {
 		return err
 	}
 
+	// Wire Phase G hybrid retrieval engine. Cohere key is optional — when
+	// absent we leave Retrieval=nil so /retrieve returns 503 instead of 404.
+	retrievalEngine, err := initRetrieval(s)
+	if err != nil {
+		// Log but don't fail startup — retrieval is opt-in.
+		slog.Warn("retrieval init failed; /retrieve will return 503", "error", err)
+	}
+
 	srv, err := server.New(server.Config{
 		IPCSecret:    cfg.IPCSecret,
 		Outbox:       ob,
@@ -73,6 +84,7 @@ func run(dataDir, addr string) error {
 		Claude:       cc,
 		DefaultModel: defaultModel,
 		Store:        s,
+		Retrieval:    retrievalEngine,
 	})
 	if err != nil {
 		return err
@@ -145,4 +157,41 @@ func reaperLoop(ctx context.Context, ob *outbox.Outbox) {
 			}
 		}
 	}
+}
+
+// initRetrieval wires the Phase G hybrid retrieval engine. Returns (nil, nil)
+// when no Cohere API key is configured — that's not an error, just a signal
+// that /retrieve should respond with 503. Returns (nil, err) only when the
+// key IS present but the engine fails to load its indexes.
+//
+// Key resolution order:
+//  1. COHERE_API_KEY env var
+//  2. ~/.openclaw/secrets/cohere-key.txt
+func initRetrieval(s *store.Store) (*retrieve.Engine, error) {
+	apiKey := strings.TrimSpace(os.Getenv("COHERE_API_KEY"))
+	if apiKey == "" {
+		home, _ := os.UserHomeDir()
+		keyPath := filepath.Join(home, ".openclaw", "secrets", "cohere-key.txt")
+		if data, err := os.ReadFile(keyPath); err == nil {
+			apiKey = strings.TrimSpace(string(data))
+		}
+	}
+	if apiKey == "" {
+		slog.Info("retrieval: no Cohere API key found (set COHERE_API_KEY or place in ~/.openclaw/secrets/cohere-key.txt); /retrieve will respond 503")
+		return nil, nil
+	}
+
+	cohere := embed.NewCohere(apiKey, "", "")
+	engine := retrieve.New(retrieve.Config{
+		Store:    s,
+		Embedder: cohere,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := engine.Init(ctx); err != nil {
+		return nil, err
+	}
+	slog.Info("retrieval: engine initialized", "embedder", cohere.Model())
+	return engine, nil
 }
