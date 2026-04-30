@@ -2,7 +2,7 @@
 
 > Empathic memory engine for AI companions. Event-level semantic retrieval + typed belief vocabulary + emotion-aware ranking.
 
-[![Tests](https://img.shields.io/badge/tests-325_passed-brightgreen)](./scripts/tests)
+[![Tests](https://img.shields.io/badge/tests-342_passed-brightgreen)](./scripts/tests)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![Go](https://img.shields.io/badge/go-1.22%2B-00ADD8)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
