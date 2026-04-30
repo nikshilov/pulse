@@ -26,9 +26,9 @@ Pure cosine retrieval treats these pairs identically:
 
 | Pair | Cosine says | Empathic companion needs |
 |---|---|---|
-| "сорвался после 10 лет трезвости" vs "выпил пиво с другом" | same-ish | **wildly** different — one is crisis, one is mundane |
+| "relapsed after 10 years sober" vs "had a beer with a friend" | same-ish | **wildly** different — one is crisis, one is mundane |
 | invitation from a close friend vs invitation from a distant coworker | same-ish | **wildly** different — relationship weight matters |
-| "нашёл paper про memory retrieval" vs "прочитал твит про память" | same-ish | **wildly** different — one changes your project |
+| "found a paper on memory retrieval" vs "read a tweet about memory" | same-ish | **wildly** different — one changes your project |
 
 Garden Pulse disambiguates via **typed belief weights**, **emotional signatures**, and **recency per belief class**.
 
@@ -217,7 +217,7 @@ embed_events(con, embedder_model="openai-text-embedding-3-large")
 # Retrieve top-3 relevant events
 events = retrieve_events(
     con,
-    query="как дела с Аней сегодня?",
+    query="how are things with my partner today?",
     top_k=3,
     embedder_model="openai-text-embedding-3-large",
 )
