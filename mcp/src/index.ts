@@ -70,9 +70,11 @@ interface RetrieveResponse {
 }
 
 interface IngestBody {
-  text: string;
-  ts?: string;
-  scope?: string;
+  content_text: string;
+  captured_at: string;
+  scope: string;
+  source_kind: string;
+  source_id: string;
 }
 
 async function pulseFetch<T>(path: string, body: unknown): Promise<T> {
@@ -203,11 +205,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === 'pulse_ingest') {
+      // Pulse server's Observation schema (capture.Observation) requires:
+      //   source_kind, source_id (UNIQUE for dedup),
+      //   captured_at (ISO8601),
+      //   scope (elle|nik|shared),
+      //   content_text (the actual payload — note: NOT "text")
+      // We tag MCP-originated observations with source_kind="mcp" and use
+      // "mcp:<iso-timestamp>" as a stable per-call identifier.
+      const text = String(args?.text ?? '');
+      const captured_at =
+        typeof args?.ts === 'string' ? args.ts : new Date().toISOString();
       const body: IngestBody = {
-        text: String(args?.text ?? ''),
+        content_text: text,
+        captured_at,
+        source_kind: 'mcp',
+        source_id: `mcp:${captured_at}`,
+        scope: typeof args?.scope === 'string' ? args.scope : 'shared',
       };
-      if (typeof args?.ts === 'string') body.ts = args.ts;
-      if (typeof args?.scope === 'string') body.scope = args.scope;
       const out = await pulseFetch<{ ok: boolean; observation_id?: number }>(
         '/ingest',
         { observations: [body] },
